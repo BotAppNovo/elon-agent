@@ -1,9 +1,3 @@
-[build]
-builder = "dockerfile"
-dockerfilePath = "Dockerfile"
-
 [deploy]
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
-healthcheckPath = "/"
-healthcheckTimeout = 10
+startCommand = "node index.js"
+healthcheckPath = ""

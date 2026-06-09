@@ -1,0 +1,455 @@
+'use strict';
+
+const { Telegraf } = require('telegraf');
+const { generatePost, improvePost, generateLinkedInVersion } = require('./ai');
+const { publish, normalizeIds, tweetUrl } = require('./publisher');
+const { publishPost: publishLinkedIn, linkedinPostUrl } = require('./linkedin');
+const { savePost, getSetting, saveSetting, saveContext, listContexts, getRecentPosts, clearContexts, getRssSources, saveRssSource, removeRssSource } = require('./db');
+const { DEFAULT_SOURCES } = require('./research');
+const { formatPostPreview, getNextScheduledPost, parseEditedText, postToStorableContent, escHtml } = require('./utils');
+
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+
+const OWNER_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const X_USERNAME = process.env.X_USERNAME || null;
+
+// ─── Estado em memória ───────────────────────────────────────────────────────
+
+// postId -> { post, source, messageId }
+const pendingApprovals = new Map();
+
+// chatId -> { postId, step: 'awaiting_edit' | 'awaiting_feedback' }
+const editingState = new Map();
+
+// ─── Middleware de segurança ─────────────────────────────────────────────────
+
+bot.use((ctx, next) => {
+  const chatId = ctx.chat?.id?.toString();
+  if (chatId !== OWNER_CHAT_ID) {
+    console.warn(`[bot] Acesso nao autorizado de chatId=${chatId}`);
+    return; // ignora silenciosamente
+  }
+  return next();
+});
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function newPostId() {
+  return `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+}
+
+function approvalKeyboard(postId) {
+  return {
+    inline_keyboard: [[
+      { text: '✅ Aprovar', callback_data: `approve:${postId}` },
+      { text: '✏️ Editar', callback_data: `edit:${postId}` },
+      { text: '❌ Descartar', callback_data: `discard:${postId}` },
+    ]],
+  };
+}
+
+function approveOnlyKeyboard(postId) {
+  return {
+    inline_keyboard: [[
+      { text: '✅ Aprovar', callback_data: `approve:${postId}` },
+      { text: '❌ Descartar', callback_data: `discard:${postId}` },
+    ]],
+  };
+}
+
+function linkedinEnabled() {
+  return !!process.env.LINKEDIN_ACCESS_TOKEN;
+}
+
+async function doPublish(post, source) {
+  // Publica no X
+  const result = await publish(post);
+  const xIds = normalizeIds(result);
+
+  // Publica no LinkedIn (opcional — falha silenciosa para não bloquear X)
+  let linkedinPostId = null;
+  if (linkedinEnabled()) {
+    try {
+      const liText = await generateLinkedInVersion(post);
+      linkedinPostId = await publishLinkedIn(liText);
+    } catch (err) {
+      console.error('[bot] LinkedIn publish falhou (X ok):', err.message);
+    }
+  }
+
+  savePost({
+    content: postToStorableContent(post),
+    format: post.format,
+    tweet_ids: xIds,
+    source,
+    linkedin_post_id: linkedinPostId,
+  });
+
+  return { xIds, linkedinPostId };
+}
+
+function buildPublishedMessage(post, xIds, linkedinPostId) {
+  const preview = formatPostPreview(post);
+  const xUrl = tweetUrl(xIds[0], X_USERNAME);
+
+  let msg = `✅ <b>Publicado!</b>\n\n${preview}\n\n`;
+  msg += `<a href="${xUrl}">Ver no X</a>`;
+
+  if (linkedinPostId) {
+    const liUrl = linkedinPostUrl(linkedinPostId);
+    msg += ` · <a href="${liUrl}">Ver no LinkedIn</a>`;
+  }
+
+  return msg;
+}
+
+// ─── sendForApproval — usado pelo scheduler e por comandos manuais ────────────
+
+async function sendForApproval(post, source = 'manual') {
+  const postId = newPostId();
+  const preview = formatPostPreview(post);
+
+  const message = await bot.telegram.sendMessage(
+    OWNER_CHAT_ID,
+    `📝 <b>Post gerado</b>\n\n${preview}`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: approvalKeyboard(postId),
+    }
+  );
+
+  pendingApprovals.set(postId, { post, source, messageId: message.message_id });
+  return message;
+}
+
+// ─── Comandos ────────────────────────────────────────────────────────────────
+
+bot.command('start', (ctx) => {
+  ctx.replyWithHTML(
+    `<b>Agente Elon ativo.</b>\n\n` +
+    `Envie qualquer texto, link ou legenda de imagem para gerar um post para o X.\n\n` +
+    `<b>Comandos:</b>\n` +
+    `/auto on — Liga modo autônomo (publica direto)\n` +
+    `/auto off — Desliga modo autônomo (pede aprovação)\n` +
+    `/status — Ver configurações e próximo post\n` +
+    `/gerar — Gerar post agora (sem input)\n` +
+    `/contexto [texto] — Adicionar contexto ao agente\n` +
+    `/historico — Ver últimos 5 posts publicados\n` +
+    `/limpar_contextos — Remove todos os contextos salvos\n` +
+    `/fontes — Ver e gerenciar fontes de RSS`
+  );
+});
+
+bot.command('auto', (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  const action = (args[0] || '').toLowerCase();
+
+  if (action === 'on') {
+    saveSetting('autonomous_mode', 'true');
+    ctx.replyWithHTML(
+      `🟢 <b>Modo autônomo ATIVADO</b>\n` +
+      `Posts serão publicados direto no X sem pedir aprovação.`
+    );
+  } else if (action === 'off') {
+    saveSetting('autonomous_mode', 'false');
+    ctx.replyWithHTML(
+      `🔴 <b>Modo autônomo DESATIVADO</b>\n` +
+      `Posts serão enviados aqui para aprovação antes de publicar.`
+    );
+  } else {
+    const isOn = getSetting('autonomous_mode') === 'true';
+    ctx.replyWithHTML(
+      `Modo autônomo: <b>${isOn ? '🟢 ON' : '🔴 OFF'}</b>\n\nUse <code>/auto on</code> ou <code>/auto off</code>`
+    );
+  }
+});
+
+bot.command('status', (ctx) => {
+  const isAuto = getSetting('autonomous_mode') === 'true';
+  const contexts = listContexts();
+  const nextPost = getNextScheduledPost();
+
+  let text =
+    `<b>Status — Agente Elon</b>\n\n` +
+    `Modo autônomo: <b>${isAuto ? '🟢 ON' : '🔴 OFF'}</b>\n` +
+    `Próximo post: <b>${nextPost}</b>\n` +
+    `Horários: 8h · 10h · 13h · 17h · 20h (Brasília)\n\n`;
+
+  if (contexts.length > 0) {
+    text += `<b>Contextos ativos (${contexts.length}):</b>\n`;
+    contexts.slice(0, 6).forEach((c, i) => {
+      const snippet = c.content.length > 85 ? c.content.substring(0, 85) + '…' : c.content;
+      text += `${i + 1}. ${escHtml(snippet)}\n`;
+    });
+    if (contexts.length > 6) {
+      text += `<i>…e mais ${contexts.length - 6} contextos</i>`;
+    }
+  } else {
+    text += `Nenhum contexto salvo ainda.`;
+  }
+
+  ctx.replyWithHTML(text);
+});
+
+bot.command('contexto', (ctx) => {
+  const rawText = ctx.message.text.replace(/^\/contexto\s*/i, '').trim();
+
+  if (!rawText) {
+    return ctx.replyWithHTML(
+      `Use: <code>/contexto [texto]</code>\n\n` +
+      `Exemplo: <code>/contexto lançamos v1.1 com recorrência e modo offline</code>\n\n` +
+      `O contexto é salvo e usado pela IA nos próximos posts.`
+    );
+  }
+
+  saveContext(rawText);
+  ctx.replyWithHTML(`✅ <b>Contexto salvo:</b>\n<i>${escHtml(rawText)}</i>`);
+});
+
+bot.command('limpar_contextos', (ctx) => {
+  clearContexts();
+  ctx.replyWithHTML(`🗑 Todos os contextos foram removidos.`);
+});
+
+bot.command('historico', (ctx) => {
+  const posts = getRecentPosts(5);
+
+  if (posts.length === 0) {
+    return ctx.replyWithHTML(`Nenhum post publicado ainda.`);
+  }
+
+  let text = `<b>Últimos posts publicados:</b>\n\n`;
+
+  posts.forEach((p, i) => {
+    const date = new Date(p.published_at).toLocaleDateString('pt-BR');
+    const snippet = p.content.length > 100 ? p.content.substring(0, 100) + '…' : p.content;
+    const xIds = JSON.parse(p.tweet_ids || '[]');
+
+    const links = [];
+    if (xIds[0]) links.push(`<a href="${tweetUrl(xIds[0], X_USERNAME)}">X</a>`);
+    if (p.linkedin_post_id) links.push(`<a href="${linkedinPostUrl(p.linkedin_post_id)}">LinkedIn</a>`);
+    const linkStr = links.length ? ` — ${links.join(' · ')}` : '';
+
+    text += `<b>${i + 1}. [${p.format}]</b> ${date}${linkStr}\n${escHtml(snippet)}\n\n`;
+  });
+
+  ctx.replyWithHTML(text, { disable_web_page_preview: true });
+});
+
+bot.command('fontes', (ctx) => {
+  const args = ctx.message.text.replace(/^\/fontes\s*/i, '').trim();
+
+  // /fontes add <url> <nome>
+  if (args.toLowerCase().startsWith('add ')) {
+    const rest = args.slice(4).trim();
+    const urlMatch = rest.match(/^(https?:\/\/\S+)\s+(.*)/);
+    if (!urlMatch) {
+      return ctx.replyWithHTML(
+        `Uso: <code>/fontes add https://url.com Nome do Feed</code>\n\nExemplo:\n<code>/fontes add https://blog.exemplo.com/feed Meu Blog</code>`
+      );
+    }
+    const [, url, name] = urlMatch;
+    saveRssSource(name.trim(), url);
+    return ctx.replyWithHTML(`✅ <b>Fonte adicionada:</b> ${escHtml(name.trim())}\n<code>${escHtml(url)}</code>`);
+  }
+
+  // /fontes remover <id>
+  if (args.toLowerCase().startsWith('remover ')) {
+    const id = parseInt(args.slice(8).trim(), 10);
+    if (isNaN(id)) {
+      return ctx.replyWithHTML(`Uso: <code>/fontes remover [id]</code>\n\nObtena o ID com <code>/fontes</code>`);
+    }
+    removeRssSource(id);
+    return ctx.replyWithHTML(`🗑 Fonte <code>${id}</code> removida.`);
+  }
+
+  // /fontes — listar tudo
+  const userSources = getRssSources();
+  const researchEnabled = process.env.RESEARCH_ENABLED !== 'false';
+
+  let text = `<b>Fontes de RSS</b>\n`;
+  text += `Pesquisa automática: <b>${researchEnabled ? '🟢 ON' : '🔴 OFF'}</b>\n\n`;
+
+  text += `<b>Padrão (${DEFAULT_SOURCES.length}):</b>\n`;
+  DEFAULT_SOURCES.forEach((s) => {
+    text += `• <b>${escHtml(s.name)}</b> — ${escHtml(s.desc)}\n`;
+  });
+
+  if (userSources.length > 0) {
+    text += `\n<b>Suas fontes (${userSources.length}):</b>\n`;
+    userSources.forEach((s) => {
+      text += `[${s.id}] <b>${escHtml(s.name)}</b>\n<code>${escHtml(s.url)}</code>\n`;
+    });
+  } else {
+    text += `\nNenhuma fonte customizada adicionada ainda.`;
+  }
+
+  text += `\n\n<b>Adicionar fonte:</b>\n<code>/fontes add https://url.com Nome</code>`;
+  text += `\n<b>Remover fonte:</b>\n<code>/fontes remover [id]</code>`;
+
+  ctx.replyWithHTML(text, { disable_web_page_preview: true });
+});
+
+bot.command('gerar', async (ctx) => {
+  const loadingMsg = await ctx.reply('⏳ Gerando post...');
+
+  try {
+    const post = await generatePost();
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    await handleGeneratedPost(ctx, post, 'manual');
+  } catch (err) {
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    ctx.replyWithHTML(`❌ <b>Erro:</b> ${escHtml(err.message)}`);
+  }
+});
+
+// ─── Mensagens de texto (input para geração) ──────────────────────────────────
+
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text || '';
+  const chatId = ctx.chat.id.toString();
+
+  // Ignora comandos (são tratados acima)
+  if (ctx.message.entities?.some((e) => e.type === 'bot_command')) return;
+
+  // Modo de edição: esperando texto editado do usuário
+  const editState = editingState.get(chatId);
+  if (editState) {
+    editingState.delete(chatId);
+    await handleEditReply(ctx, text, editState);
+    return;
+  }
+
+  // Geração normal a partir do input
+  const loadingMsg = await ctx.reply('⏳ Processando...');
+  try {
+    const post = await generatePost(text);
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    await handleGeneratedPost(ctx, post, 'manual');
+  } catch (err) {
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    ctx.replyWithHTML(`❌ <b>Erro:</b> ${escHtml(err.message)}`);
+  }
+});
+
+// ─── Fotos (usa legenda como input) ──────────────────────────────────────────
+
+bot.on('photo', async (ctx) => {
+  const caption = ctx.message.caption || '';
+  const loadingMsg = await ctx.reply('⏳ Processando imagem...');
+
+  try {
+    const post = await generatePost(caption || null);
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    await handleGeneratedPost(ctx, post, 'manual');
+  } catch (err) {
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    ctx.replyWithHTML(`❌ <b>Erro:</b> ${escHtml(err.message)}`);
+  }
+});
+
+// ─── Callbacks dos botões inline ─────────────────────────────────────────────
+
+// Aprovar → publicar
+bot.action(/^approve:(.+)$/, async (ctx) => {
+  const postId = ctx.match[1];
+
+  await ctx.answerCbQuery('Publicando...').catch(() => {});
+
+  const pending = pendingApprovals.get(postId);
+  if (!pending) {
+    return ctx.editMessageText('❌ Post não encontrado (bot pode ter reiniciado).').catch(() => {});
+  }
+
+  try {
+    const { xIds, linkedinPostId } = await doPublish(pending.post, pending.source);
+    pendingApprovals.delete(postId);
+
+    const successMsg = buildPublishedMessage(pending.post, xIds, linkedinPostId);
+    await ctx.editMessageText(successMsg, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: false,
+    }).catch(() => {});
+  } catch (err) {
+    console.error('[bot] Erro ao publicar:', err);
+    ctx.answerCbQuery(`Erro: ${err.message}`, { show_alert: true }).catch(() => {});
+  }
+});
+
+// Editar → entrar em modo de edição
+bot.action(/^edit:(.+)$/, async (ctx) => {
+  const postId = ctx.match[1];
+  const chatId = ctx.chat.id.toString();
+
+  await ctx.answerCbQuery().catch(() => {});
+
+  const pending = pendingApprovals.get(postId);
+  if (!pending) {
+    return ctx.editMessageText('❌ Post não encontrado.').catch(() => {});
+  }
+
+  editingState.set(chatId, { postId, step: 'awaiting_edit' });
+
+  const { format } = pending.post;
+  let hint = '';
+  if (format === 'thread') {
+    hint = '\n\n<i>Para thread: envie os tweets numerados:\n1/ primeiro tweet\n2/ segundo tweet</i>';
+  } else if (format === 'poll') {
+    hint = '\n\n<i>Para enquete:\nEscreva a pergunta na 1a linha\n- opção 1\n- opção 2</i>';
+  }
+
+  await ctx.replyWithHTML(`✏️ <b>Envie o texto editado:</b>${hint}`);
+});
+
+// Descartar
+bot.action(/^discard:(.+)$/, async (ctx) => {
+  const postId = ctx.match[1];
+  await ctx.answerCbQuery('Descartado').catch(() => {});
+  pendingApprovals.delete(postId);
+  await ctx.editMessageText('❌ Post descartado.').catch(() => {});
+});
+
+// ─── Handlers internos ────────────────────────────────────────────────────────
+
+async function handleGeneratedPost(ctx, post, source) {
+  const isAuto = getSetting('autonomous_mode') === 'true';
+
+  if (isAuto) {
+    try {
+      const { xIds, linkedinPostId } = await doPublish(post, source);
+      const msg = buildPublishedMessage(post, xIds, linkedinPostId);
+      await ctx.replyWithHTML(msg, { disable_web_page_preview: false });
+    } catch (err) {
+      ctx.replyWithHTML(`❌ <b>Erro ao publicar:</b> ${escHtml(err.message)}`);
+    }
+  } else {
+    await sendForApproval(post, source);
+  }
+}
+
+async function handleEditReply(ctx, editedText, editState) {
+  const { postId } = editState;
+  const pending = pendingApprovals.get(postId);
+
+  if (!pending) {
+    return ctx.replyWithHTML(`❌ Post não encontrado. Use /gerar para criar um novo.`);
+  }
+
+  const updatedPost = parseEditedText(pending.post, editedText);
+  pendingApprovals.set(postId, { ...pending, post: updatedPost });
+
+  const preview = formatPostPreview(updatedPost);
+
+  await ctx.replyWithHTML(
+    `✏️ <b>Post editado:</b>\n\n${preview}`,
+    { reply_markup: approveOnlyKeyboard(postId) }
+  );
+}
+
+// ─── Launch ───────────────────────────────────────────────────────────────────
+
+async function launch() {
+  await bot.launch();
+}
+
+module.exports = { bot, launch, sendForApproval, pendingApprovals };

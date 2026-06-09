@@ -77,7 +77,7 @@ async function doPublish(post, source) {
     }
   }
 
-  savePost({
+  await savePost({
     content: postToStorableContent(post),
     format: post.format,
     tweet_ids: xIds,
@@ -140,33 +140,33 @@ bot.command('start', (ctx) => {
   );
 });
 
-bot.command('auto', (ctx) => {
+bot.command('auto', async (ctx) => {
   const args = ctx.message.text.split(/\s+/).slice(1);
   const action = (args[0] || '').toLowerCase();
 
   if (action === 'on') {
-    saveSetting('autonomous_mode', 'true');
+    await saveSetting('autonomous_mode', 'true');
     ctx.replyWithHTML(
       `🟢 <b>Modo autônomo ATIVADO</b>\n` +
       `Posts serão publicados direto no X sem pedir aprovação.`
     );
   } else if (action === 'off') {
-    saveSetting('autonomous_mode', 'false');
+    await saveSetting('autonomous_mode', 'false');
     ctx.replyWithHTML(
       `🔴 <b>Modo autônomo DESATIVADO</b>\n` +
       `Posts serão enviados aqui para aprovação antes de publicar.`
     );
   } else {
-    const isOn = getSetting('autonomous_mode') === 'true';
+    const isOn = (await getSetting('autonomous_mode')) === 'true';
     ctx.replyWithHTML(
       `Modo autônomo: <b>${isOn ? '🟢 ON' : '🔴 OFF'}</b>\n\nUse <code>/auto on</code> ou <code>/auto off</code>`
     );
   }
 });
 
-bot.command('status', (ctx) => {
-  const isAuto = getSetting('autonomous_mode') === 'true';
-  const contexts = listContexts();
+bot.command('status', async (ctx) => {
+  const isAuto = (await getSetting('autonomous_mode')) === 'true';
+  const contexts = await listContexts();
   const nextPost = getNextScheduledPost();
 
   let text =
@@ -191,7 +191,7 @@ bot.command('status', (ctx) => {
   ctx.replyWithHTML(text);
 });
 
-bot.command('contexto', (ctx) => {
+bot.command('contexto', async (ctx) => {
   const rawText = ctx.message.text.replace(/^\/contexto\s*/i, '').trim();
 
   if (!rawText) {
@@ -202,17 +202,17 @@ bot.command('contexto', (ctx) => {
     );
   }
 
-  saveContext(rawText);
+  await saveContext(rawText);
   ctx.replyWithHTML(`✅ <b>Contexto salvo:</b>\n<i>${escHtml(rawText)}</i>`);
 });
 
-bot.command('limpar_contextos', (ctx) => {
-  clearContexts();
+bot.command('limpar_contextos', async (ctx) => {
+  await clearContexts();
   ctx.replyWithHTML(`🗑 Todos os contextos foram removidos.`);
 });
 
-bot.command('historico', (ctx) => {
-  const posts = getRecentPosts(5);
+bot.command('historico', async (ctx) => {
+  const posts = await getRecentPosts(5);
 
   if (posts.length === 0) {
     return ctx.replyWithHTML(`Nenhum post publicado ainda.`);
@@ -236,7 +236,7 @@ bot.command('historico', (ctx) => {
   ctx.replyWithHTML(text, { disable_web_page_preview: true });
 });
 
-bot.command('fontes', (ctx) => {
+bot.command('fontes', async (ctx) => {
   const args = ctx.message.text.replace(/^\/fontes\s*/i, '').trim();
 
   // /fontes add <url> <nome>
@@ -249,7 +249,7 @@ bot.command('fontes', (ctx) => {
       );
     }
     const [, url, name] = urlMatch;
-    saveRssSource(name.trim(), url);
+    await saveRssSource(name.trim(), url);
     return ctx.replyWithHTML(`✅ <b>Fonte adicionada:</b> ${escHtml(name.trim())}\n<code>${escHtml(url)}</code>`);
   }
 
@@ -259,12 +259,12 @@ bot.command('fontes', (ctx) => {
     if (isNaN(id)) {
       return ctx.replyWithHTML(`Uso: <code>/fontes remover [id]</code>\n\nObtena o ID com <code>/fontes</code>`);
     }
-    removeRssSource(id);
+    await removeRssSource(id);
     return ctx.replyWithHTML(`🗑 Fonte <code>${id}</code> removida.`);
   }
 
   // /fontes — listar tudo
-  const userSources = getRssSources();
+  const userSources = await getRssSources();
   const researchEnabled = process.env.RESEARCH_ENABLED !== 'false';
 
   let text = `<b>Fontes de RSS</b>\n`;
@@ -412,7 +412,7 @@ bot.action(/^discard:(.+)$/, async (ctx) => {
 // ─── Handlers internos ────────────────────────────────────────────────────────
 
 async function handleGeneratedPost(ctx, post, source) {
-  const isAuto = getSetting('autonomous_mode') === 'true';
+  const isAuto = (await getSetting('autonomous_mode')) === 'true';
 
   if (isAuto) {
     try {

@@ -14,7 +14,7 @@ const server = http.createServer((req, res) => {
 async function main() {
   console.log('[elon] Iniciando agente...');
 
-  initDb();
+  await initDb();
   console.log('[elon] Banco de dados OK');
 
   startScheduler(sendForApproval, bot.telegram);

@@ -43,7 +43,7 @@ async function runJob(label, sendForApproval, telegram) {
   try {
     const research = await gatherResearch();
     const post = await generatePost(null, research);
-    const isAuto = getSetting('autonomous_mode') === 'true';
+    const isAuto = (await getSetting('autonomous_mode')) === 'true';
 
     if (isAuto) {
       await runAutonomous(post, label, telegram);
@@ -75,7 +75,7 @@ async function runAutonomous(post, label, telegram) {
     }
   }
 
-  savePost({
+  await savePost({
     content: postToStorableContent(post),
     format: post.format,
     tweet_ids: xIds,

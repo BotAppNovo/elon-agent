@@ -72,8 +72,8 @@ Para formatos simples (opinion, question, metric), "tweets" e "poll_options" dev
 async function generatePost(input = null, research = null) {
   // Quando research é fornecido (via cron), ele já contém os contextos.
   // Para posts manuais, buscamos os contextos diretamente do DB.
-  const contexts = research ? [] : getActiveContexts(6);
-  const recentPosts = getRecentPosts(15);
+  const contexts = research ? [] : await getActiveContexts(6);
+  const recentPosts = await getRecentPosts(15);
 
   // Mapeia contagem de formatos recentes para forçar variedade
   const formatCounts = recentPosts.reduce((acc, p) => {

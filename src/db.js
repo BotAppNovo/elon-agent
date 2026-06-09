@@ -1,38 +1,45 @@
 'use strict';
 
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
+const { Pool } = require('pg');
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, '../data/elon.db');
+const DATABASE_URL = process.env.DATABASE_URL;
 
-let db;
+let pool;
 
-function initDb() {
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+function getPool() {
+  if (!pool) throw new Error('Database nao inicializado — chame initDb() primeiro');
+  return pool;
+}
 
-  db = new Database(DB_PATH);
+async function initDb() {
+  const isLocal = DATABASE_URL && (
+    DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1')
+  );
 
-  db.pragma('journal_mode = WAL');
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: isLocal ? false : { rejectUnauthorized: false },
+  });
 
-  db.exec(`
+  // Smoke-test the connection
+  await pool.query('SELECT 1');
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS posts (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      content     TEXT    NOT NULL,
-      format      TEXT    NOT NULL,
-      tweet_ids   TEXT,
-      source      TEXT    NOT NULL DEFAULT 'manual',
-      published_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      id            SERIAL PRIMARY KEY,
+      content       TEXT        NOT NULL,
+      format        TEXT        NOT NULL,
+      tweet_ids     TEXT,
+      source        TEXT        NOT NULL DEFAULT 'manual',
+      linkedin_post_id TEXT,
+      published_at  TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS contexts (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      content    TEXT    NOT NULL,
-      active     INTEGER NOT NULL DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      id         SERIAL PRIMARY KEY,
+      content    TEXT        NOT NULL,
+      active     INTEGER     NOT NULL DEFAULT 1,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -41,121 +48,129 @@ function initDb() {
     );
 
     CREATE TABLE IF NOT EXISTS rss_sources (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      name       TEXT    NOT NULL,
-      url        TEXT    NOT NULL UNIQUE,
-      active     INTEGER NOT NULL DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      id         SERIAL PRIMARY KEY,
+      name       TEXT        NOT NULL,
+      url        TEXT        NOT NULL UNIQUE,
+      active     INTEGER     NOT NULL DEFAULT 1,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 
-  // Migração: adiciona linkedin_post_id se a coluna ainda não existir
-  try {
-    db.exec('ALTER TABLE posts ADD COLUMN linkedin_post_id TEXT');
-  } catch {
-    // Coluna já existe — ignorar
+  // Default: autonomous_mode off
+  const existing = await pool.query(
+    "SELECT value FROM settings WHERE key = 'autonomous_mode'"
+  );
+  if (existing.rows.length === 0) {
+    await pool.query(
+      "INSERT INTO settings (key, value) VALUES ('autonomous_mode', 'false')"
+    );
   }
 
-  // Defaults
-  if (getSetting('autonomous_mode') === null) {
-    saveSetting('autonomous_mode', 'false');
-  }
-
-  return db;
-}
-
-function getDb() {
-  if (!db) throw new Error('Database nao inicializado — chame initDb() primeiro');
-  return db;
+  return pool;
 }
 
 // ----- Settings -----
 
-function saveSetting(key, value) {
-  getDb()
-    .prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
-    .run(key, String(value));
+async function saveSetting(key, value) {
+  await getPool().query(
+    `INSERT INTO settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [key, String(value)]
+  );
 }
 
-function getSetting(key) {
-  const row = getDb()
-    .prepare('SELECT value FROM settings WHERE key = ?')
-    .get(key);
-  return row ? row.value : null;
+async function getSetting(key) {
+  const res = await getPool().query(
+    'SELECT value FROM settings WHERE key = $1',
+    [key]
+  );
+  return res.rows[0] ? res.rows[0].value : null;
 }
 
 // ----- Posts -----
 
-function savePost({ content, format, tweet_ids = [], source = 'manual', linkedin_post_id = null }) {
-  const result = getDb()
-    .prepare('INSERT INTO posts (content, format, tweet_ids, source, linkedin_post_id) VALUES (?, ?, ?, ?, ?)')
-    .run(content, format, JSON.stringify(tweet_ids), source, linkedin_post_id);
-  return result.lastInsertRowid;
+async function savePost({ content, format, tweet_ids = [], source = 'manual', linkedin_post_id = null }) {
+  const res = await getPool().query(
+    `INSERT INTO posts (content, format, tweet_ids, source, linkedin_post_id)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id`,
+    [content, format, JSON.stringify(tweet_ids), source, linkedin_post_id]
+  );
+  return res.rows[0].id;
 }
 
-function getRecentPosts(limit = 20) {
-  return getDb()
-    .prepare('SELECT * FROM posts ORDER BY published_at DESC LIMIT ?')
-    .all(limit);
+async function getRecentPosts(limit = 20) {
+  const res = await getPool().query(
+    'SELECT * FROM posts ORDER BY published_at DESC LIMIT $1',
+    [limit]
+  );
+  return res.rows;
 }
 
 // ----- Contexts -----
 
-function saveContext(content) {
-  const result = getDb()
-    .prepare('INSERT INTO contexts (content) VALUES (?)')
-    .run(content);
-  return result.lastInsertRowid;
+async function saveContext(content) {
+  const res = await getPool().query(
+    'INSERT INTO contexts (content) VALUES ($1) RETURNING id',
+    [content]
+  );
+  return res.rows[0].id;
 }
 
-function getActiveContexts(limit = 8) {
-  return getDb()
-    .prepare('SELECT * FROM contexts WHERE active = 1 ORDER BY created_at DESC LIMIT ?')
-    .all(limit);
+async function getActiveContexts(limit = 8) {
+  const res = await getPool().query(
+    'SELECT * FROM contexts WHERE active = 1 ORDER BY created_at DESC LIMIT $1',
+    [limit]
+  );
+  return res.rows;
 }
 
-function listContexts() {
-  return getDb()
-    .prepare('SELECT * FROM contexts WHERE active = 1 ORDER BY created_at DESC')
-    .all();
+async function listContexts() {
+  const res = await getPool().query(
+    'SELECT * FROM contexts WHERE active = 1 ORDER BY created_at DESC'
+  );
+  return res.rows;
 }
 
-function deactivateContext(id) {
-  getDb()
-    .prepare('UPDATE contexts SET active = 0 WHERE id = ?')
-    .run(id);
+async function deactivateContext(id) {
+  await getPool().query(
+    'UPDATE contexts SET active = 0 WHERE id = $1',
+    [id]
+  );
 }
 
-function clearContexts() {
-  getDb()
-    .prepare('UPDATE contexts SET active = 0')
-    .run();
+async function clearContexts() {
+  await getPool().query('UPDATE contexts SET active = 0');
 }
 
 // ----- RSS Sources -----
 
-function getRssSources() {
-  return getDb()
-    .prepare('SELECT * FROM rss_sources WHERE active = 1 ORDER BY created_at ASC')
-    .all();
+async function getRssSources() {
+  const res = await getPool().query(
+    'SELECT * FROM rss_sources WHERE active = 1 ORDER BY created_at ASC'
+  );
+  return res.rows;
 }
 
-function saveRssSource(name, url) {
-  const result = getDb()
-    .prepare('INSERT OR IGNORE INTO rss_sources (name, url) VALUES (?, ?)')
-    .run(name, url);
-  return result.lastInsertRowid;
+async function saveRssSource(name, url) {
+  const res = await getPool().query(
+    `INSERT INTO rss_sources (name, url) VALUES ($1, $2)
+     ON CONFLICT (url) DO NOTHING
+     RETURNING id`,
+    [name, url]
+  );
+  return res.rows[0]?.id ?? null;
 }
 
-function removeRssSource(id) {
-  getDb()
-    .prepare('UPDATE rss_sources SET active = 0 WHERE id = ?')
-    .run(id);
+async function removeRssSource(id) {
+  await getPool().query(
+    'UPDATE rss_sources SET active = 0 WHERE id = $1',
+    [id]
+  );
 }
 
 module.exports = {
   initDb,
-  getDb,
   saveSetting,
   getSetting,
   savePost,

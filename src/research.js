@@ -68,7 +68,7 @@ async function gatherResearch() {
     return {
       rssItems: [],
       xInsights: [],
-      contexts: getActiveContexts(8),
+      contexts: await getActiveContexts(8),
       fetchedAt: new Date().toISOString(),
       skipped: true,
     };
@@ -91,14 +91,14 @@ async function gatherResearch() {
   const fetchedAt = new Date().toISOString();
 
   // Persiste o timestamp da última pesquisa para o /fontes
-  saveSetting('last_research_at', fetchedAt);
-  saveSetting('last_research_rss_count', String(rssItems.length));
-  saveSetting('last_research_x_count', String(xInsights.length));
+  await saveSetting('last_research_at', fetchedAt);
+  await saveSetting('last_research_rss_count', String(rssItems.length));
+  await saveSetting('last_research_x_count', String(xInsights.length));
 
   return {
     rssItems,
     xInsights,
-    contexts: getActiveContexts(8),
+    contexts: await getActiveContexts(8),
     fetchedAt,
   };
 }
@@ -106,7 +106,7 @@ async function gatherResearch() {
 // ─── RSS ──────────────────────────────────────────────────────────────────────
 
 async function fetchAllRss() {
-  const userSources = getRssSources(); // fontes adicionadas pelo usuário via /fontes
+  const userSources = await getRssSources(); // fontes adicionadas pelo usuário via /fontes
   const allSources = [
     ...DEFAULT_SOURCES,
     ...userSources.map((s) => ({ name: s.name, url: s.url, desc: 'Custom' })),

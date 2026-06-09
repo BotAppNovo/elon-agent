@@ -2,7 +2,7 @@
 
 const { Telegraf } = require('telegraf');
 const { generatePost, improvePost, generateLinkedInVersion } = require('./ai');
-const { publish, normalizeIds, tweetUrl } = require('./publisher');
+const { publish, normalizeIds, rawResponse, tweetUrl } = require('./publisher');
 const { publishPost: publishLinkedIn, linkedinPostUrl } = require('./linkedin');
 const { savePost, getSetting, saveSetting, saveContext, listContexts, getRecentPosts, clearContexts, getRssSources, saveRssSource, removeRssSource } = require('./db');
 const { DEFAULT_SOURCES } = require('./research');
@@ -62,9 +62,16 @@ function linkedinEnabled() {
 }
 
 async function doPublish(post, source) {
-  // Publica no X
+  console.log('[bot] Iniciando publicação no X...');
+  console.log('[bot] Formato:', post.format);
+  console.log('[bot] Texto completo do post:\n' + formatPostPreview(post));
+
   const result = await publish(post);
   const xIds = normalizeIds(result);
+  const xRaw = rawResponse(result);
+
+  console.log('[bot] Resposta da API do X — IDs publicados:', xIds);
+  console.log('[bot] Resposta raw da API do X:', JSON.stringify(xRaw, null, 2));
 
   // Publica no LinkedIn (opcional — falha silenciosa para não bloquear X)
   let linkedinPostId = null;
@@ -72,6 +79,7 @@ async function doPublish(post, source) {
     try {
       const liText = await generateLinkedInVersion(post);
       linkedinPostId = await publishLinkedIn(liText);
+      console.log('[bot] LinkedIn publicado — ID:', linkedinPostId);
     } catch (err) {
       console.error('[bot] LinkedIn publish falhou (X ok):', err.message);
     }
@@ -354,10 +362,13 @@ bot.on('photo', async (ctx) => {
 bot.action(/^approve:(.+)$/, async (ctx) => {
   const postId = ctx.match[1];
 
+  console.log(`[bot] Aprovação recebida para post ID: ${postId}`);
+
   await ctx.answerCbQuery('Publicando...').catch(() => {});
 
   const pending = pendingApprovals.get(postId);
   if (!pending) {
+    console.warn(`[bot] Post ID ${postId} não encontrado em pendingApprovals (bot pode ter reiniciado)`);
     return ctx.editMessageText('❌ Post não encontrado (bot pode ter reiniciado).').catch(() => {});
   }
 
@@ -365,14 +376,27 @@ bot.action(/^approve:(.+)$/, async (ctx) => {
     const { xIds, linkedinPostId } = await doPublish(pending.post, pending.source);
     pendingApprovals.delete(postId);
 
+    console.log(`[bot] Publicação concluída — tweet IDs: ${xIds.join(', ')}`);
+
     const successMsg = buildPublishedMessage(pending.post, xIds, linkedinPostId);
     await ctx.editMessageText(successMsg, {
       parse_mode: 'HTML',
       disable_web_page_preview: false,
     }).catch(() => {});
   } catch (err) {
-    console.error('[bot] Erro ao publicar:', err);
-    ctx.answerCbQuery(`Erro: ${err.message}`, { show_alert: true }).catch(() => {});
+    console.error('[bot] Erro ao publicar — mensagem:', err.message);
+    console.error('[bot] Erro ao publicar — stack:\n', err.stack);
+
+    // Notifica no Telegram em vez de ficar silencioso
+    const errMsg =
+      `❌ <b>Falha ao publicar post ID ${escHtml(postId)}</b>\n\n` +
+      `<b>Erro:</b> ${escHtml(err.message)}\n\n` +
+      `<i>Verifique os logs do servidor para o stack trace completo.</i>`;
+
+    await ctx.editMessageText(errMsg, { parse_mode: 'HTML' }).catch(() => {});
+    await bot.telegram
+      .sendMessage(OWNER_CHAT_ID, errMsg, { parse_mode: 'HTML' })
+      .catch(() => {});
   }
 });
 

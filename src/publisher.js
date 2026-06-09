@@ -23,7 +23,7 @@ function getClient() {
 async function publishTweet(text) {
   const client = getClient();
   const result = await client.v2.tweet({ text });
-  return result.data.id;
+  return { id: result.data.id, raw: result };
 }
 
 async function publishThread(tweets) {
@@ -35,6 +35,7 @@ async function publishThread(tweets) {
   const ids = [];
   let previousId = null;
 
+  const raws = [];
   for (const text of tweets) {
     const payload = { text };
     if (previousId) {
@@ -42,6 +43,7 @@ async function publishThread(tweets) {
     }
     const result = await client.v2.tweet(payload);
     ids.push(result.data.id);
+    raws.push(result);
     previousId = result.data.id;
 
     // Pequena pausa entre tweets para evitar rate limit
@@ -50,7 +52,7 @@ async function publishThread(tweets) {
     }
   }
 
-  return ids;
+  return { ids, raw: raws };
 }
 
 async function publishPoll(text, options, durationMinutes = 1440) {
@@ -73,7 +75,7 @@ async function publishPoll(text, options, durationMinutes = 1440) {
     },
   });
 
-  return result.data.id;
+  return { id: result.data.id, raw: result };
 }
 
 // ─────────────────────────────────────────────
@@ -103,10 +105,22 @@ async function publish(post) {
 
 /**
  * Normaliza o retorno de publish() para sempre retornar um array de IDs.
+ * result pode ser: { id, raw } (tweet/poll) ou { ids, raw } (thread)
  */
 function normalizeIds(result) {
+  if (result?.ids) return result.ids;   // thread
+  if (result?.id)  return [result.id];  // tweet/poll
+  // fallback para strings/arrays legados
   if (Array.isArray(result)) return result;
   return [result];
+}
+
+/**
+ * Retorna o(s) objeto(s) raw da resposta da API do X.
+ */
+function rawResponse(result) {
+  if (result?.raw) return result.raw;
+  return result;
 }
 
 // ─────────────────────────────────────────────
@@ -125,4 +139,4 @@ function tweetUrl(tweetId, username) {
   return `https://x.com/i/web/status/${tweetId}`;
 }
 
-module.exports = { publish, publishTweet, publishThread, publishPoll, normalizeIds, tweetUrl };
+module.exports = { publish, publishTweet, publishThread, publishPoll, normalizeIds, rawResponse, tweetUrl };

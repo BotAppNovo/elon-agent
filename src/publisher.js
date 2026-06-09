@@ -2,27 +2,21 @@
 
 const { TwitterApi } = require('twitter-api-v2');
 
-let _client;
+const client = new TwitterApi({
+  appKey:      process.env.X_CLIENT_ID,
+  appSecret:   process.env.X_CLIENT_SECRET,
+  accessToken: process.env.X_ACCESS_TOKEN,
+  accessSecret: process.env.X_ACCESS_TOKEN_SECRET,
+});
 
-function getClient() {
-  if (!_client) {
-    _client = new TwitterApi({
-      appKey:      process.env.X_CLIENT_ID,
-      appSecret:   process.env.X_CLIENT_SECRET,
-      accessToken: process.env.X_ACCESS_TOKEN,
-      accessSecret: process.env.X_ACCESS_TOKEN_SECRET,
-    });
-  }
-  return _client;
-}
+const rwClient = client.readWrite;
 
 // ─────────────────────────────────────────────
 // Primitivos de publicação
 // ─────────────────────────────────────────────
 
 async function publishTweet(text) {
-  const client = getClient();
-  const result = await client.v2.tweet({ text });
+  const result = await rwClient.v2.tweet({ text });
   return { id: result.data.id, raw: result };
 }
 
@@ -31,7 +25,6 @@ async function publishThread(tweets) {
     throw new Error('Thread precisa de pelo menos 1 tweet');
   }
 
-  const client = getClient();
   const ids = [];
   let previousId = null;
 
@@ -41,7 +34,7 @@ async function publishThread(tweets) {
     if (previousId) {
       payload.reply = { in_reply_to_tweet_id: previousId };
     }
-    const result = await client.v2.tweet(payload);
+    const result = await rwClient.v2.tweet(payload);
     ids.push(result.data.id);
     raws.push(result);
     previousId = result.data.id;
@@ -60,14 +53,12 @@ async function publishPoll(text, options, durationMinutes = 1440) {
     throw new Error('Enquete precisa de pelo menos 2 opcoes');
   }
 
-  const client = getClient();
-
   // API do X aceita no máximo 4 opções, máx 25 chars cada
   const cleanOptions = options
     .slice(0, 4)
     .map((o) => ({ label: String(o).substring(0, 25) }));
 
-  const result = await client.v2.tweet({
+  const result = await rwClient.v2.tweet({
     text,
     poll: {
       options: cleanOptions,

@@ -11,6 +11,13 @@ const client = new TwitterApi({
 
 const rwClient = client.readWrite;
 
+console.log('[publisher] Inicializando cliente X com:', {
+  appKey:      process.env.X_CLIENT_ID              ? process.env.X_CLIENT_ID.substring(0, 8)              + '...' : 'AUSENTE',
+  appSecret:   process.env.X_CLIENT_SECRET          ? process.env.X_CLIENT_SECRET.substring(0, 8)          + '...' : 'AUSENTE',
+  accessToken: process.env.X_ACCESS_TOKEN           ? process.env.X_ACCESS_TOKEN.substring(0, 8)           + '...' : 'AUSENTE',
+  accessSecret: process.env.X_ACCESS_TOKEN_SECRET   ? process.env.X_ACCESS_TOKEN_SECRET.substring(0, 8)   + '...' : 'AUSENTE',
+});
+
 // ─────────────────────────────────────────────
 // Primitivos de publicação
 // ─────────────────────────────────────────────

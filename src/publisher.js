@@ -95,10 +95,19 @@ async function publish(post) {
       }
       return publishPoll(post.content, post.poll_options);
 
-    default:
-      // opinion, question, metric — post simples
+    default: {
+      // opinion, question — post simples
       if (!post.content) throw new Error('Post sem conteudo');
+      // Guard: se o texto ultrapassar 280 chars, divide em thread em vez de truncar
+      if (post.content.length > 280) {
+        const parts = splitIntoThread(post.content);
+        if (parts && parts.length > 1) {
+          console.warn(`[publisher] Tweet simples com ${post.content.length} chars → dividido em thread de ${parts.length} tweets automaticamente`);
+          return publishThread(parts);
+        }
+      }
       return publishTweet(post.content);
+    }
   }
 }
 
@@ -128,6 +137,40 @@ function rawResponse(result) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Divide texto longo em partes de até 280 chars para publicar como thread.
+ * Quebra em parágrafos (dupla newline) e depois em sentenças — nunca corta no meio de uma frase.
+ * Retorna null se o texto já couber em 280 chars.
+ */
+function splitIntoThread(text) {
+  if (text.length <= 280) return null;
+
+  const chunks = [];
+  const paragraphs = text.split(/\n\n+/).map((p) => p.trim()).filter(Boolean);
+
+  for (const para of paragraphs) {
+    if (para.length <= 280) {
+      chunks.push(para);
+      continue;
+    }
+    // Quebra parágrafo longo em sentenças
+    const sentences = para.match(/[^.!?\n]+[.!?\n]+/g) || [para];
+    let current = '';
+    for (const sentence of sentences) {
+      const candidate = current ? `${current} ${sentence.trim()}` : sentence.trim();
+      if (candidate.length <= 280) {
+        current = candidate;
+      } else {
+        if (current) chunks.push(current);
+        current = sentence.trim().substring(0, 280); // fallback: corta só se sentença isolada for > 280
+      }
+    }
+    if (current) chunks.push(current);
+  }
+
+  return chunks.filter((c) => c.length > 0);
 }
 
 /**

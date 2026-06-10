@@ -48,8 +48,9 @@ REGRAS ABSOLUTAS (nunca violar):
 3. Português brasileiro natural, sem formalidade acadêmica
 4. Primeira linha PARA O SCROLL — gancho de identificação imediata, não de informação
 5. NUNCA começar com: "Hoje quero falar sobre", "Vim aqui para", "Estou animado para compartilhar"
-6. Cada tweet tem no máximo 280 caracteres
-7. NUNCA mencionar métricas internas do app: D7, D30, número de usuários, retention, dados de beta
+6. Posts simples (opinion, question): máximo 250 caracteres — conta os caracteres antes de finalizar
+7. Se o conteúdo não couber em 250 caracteres, use formato thread automaticamente — NUNCA corte uma frase no meio
+8. NUNCA mencionar métricas internas do app: D7, D30, número de usuários, retention, dados de beta
 8. Posts que provocam comentário e identificação, não só like
 
 REGRA DO MYNDIT NOS POSTS:
@@ -241,9 +242,9 @@ function normalizePost(post) {
     post.poll_options = null;
   }
 
-  // Garante 280 chars no content
+  // Garante 250 chars no content para posts simples (margem de segurança antes dos 280 do X)
   if (post.content && post.format !== 'thread') {
-    post.content = post.content.substring(0, 280);
+    post.content = post.content.substring(0, 250);
   }
 
   return post;

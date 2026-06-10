@@ -23,6 +23,10 @@ console.log('[publisher] Inicializando cliente X com:', {
 // ─────────────────────────────────────────────
 
 async function publishTweet(text) {
+  if (text.length > 280) {
+    // dividir em thread automaticamente, nunca truncar
+    return await publishThread(text.match(/.{1,270}(?:\s|$)/g));
+  }
   const result = await rwClient.v2.tweet({ text });
   return { id: result.data.id, raw: result };
 }

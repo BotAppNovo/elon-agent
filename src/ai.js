@@ -48,10 +48,10 @@ REGRAS ABSOLUTAS (nunca violar):
 3. Português brasileiro natural, sem formalidade acadêmica
 4. Primeira linha PARA O SCROLL — gancho de identificação imediata, não de informação
 5. NUNCA começar com: "Hoje quero falar sobre", "Vim aqui para", "Estou animado para compartilhar"
-6. Posts simples (opinion, question): máximo 250 caracteres — conta os caracteres antes de finalizar
-7. Se o conteúdo não couber em 250 caracteres, use formato thread automaticamente — NUNCA corte uma frase no meio
+6. Posts simples (opinion, question): máximo 240 caracteres — a contagem da IA não é exata, a margem é necessária. Conte os caracteres antes de finalizar.
+7. Se o conteúdo não couber em 240 caracteres, use formato thread automaticamente — NUNCA corte uma frase no meio
 8. NUNCA mencionar métricas internas do app: D7, D30, número de usuários, retention, dados de beta
-8. Posts que provocam comentário e identificação, não só like
+9. Posts que provocam comentário e identificação, não só like
 
 REGRA DO MYNDIT NOS POSTS:
 - Mencionar o Myndit no máximo em 1 a cada 3 posts — não em todo post
@@ -68,8 +68,8 @@ REGRA DO MYNDIT NOS POSTS:
 - Alarme sem contexto é um lembrete que chegou cedo demais para ser útil
 
 FORMATOS DISPONÍVEIS:
-- "opinion": Observação ou opinião curta (1 tweet) — o mais comum, deve dominar o feed
-- "question": Pergunta provocativa e direta para gerar resposta nos comentários
+- "opinion": Observação ou opinião curta (1 tweet, máx 240 chars) — o mais comum, deve dominar o feed
+- "question": Pergunta provocativa e direta (1 tweet, máx 240 chars) para gerar resposta nos comentários
 - "thread": 3 a 6 tweets numerados (1/, 2/...) para desenvolver uma ideia com profundidade
 - "poll": Enquete com pergunta + 2 a 4 opções curtas (máx 25 chars cada opção)
 
@@ -148,6 +148,7 @@ async function generatePost(input = null, research = null) {
     userMessage += `Escolha o formato mais impactante e garanta variedade em relação ao histórico.`;
   }
 
+  userMessage += `\n\nLEMBRETE CRÍTICO: se o formato for opinion ou question, o campo "content" DEVE ter no máximo 240 caracteres. Conte agora antes de responder. Se não couber, use format=thread.`;
   userMessage += `\n\nRetorne SOMENTE o JSON sem markdown ou blocos de código.`;
 
   const response = await getClient().chat.completions.create({
@@ -242,9 +243,9 @@ function normalizePost(post) {
     post.poll_options = null;
   }
 
-  // Garante 250 chars no content para posts simples (margem de segurança antes dos 280 do X)
+  // Garante 240 chars no content para posts simples (margem de segurança antes dos 280 do X)
   if (post.content && post.format !== 'thread') {
-    post.content = post.content.substring(0, 250);
+    post.content = post.content.substring(0, 240);
   }
 
   return post;

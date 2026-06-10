@@ -1,6 +1,9 @@
 'use strict';
 
+const { getSetting, saveSetting } = require('./db');
+
 const LINKEDIN_API = 'https://api.linkedin.com/v2';
+const DB_URN_KEY = 'linkedin_person_urn';
 
 let cachedPersonUrn = null;
 
@@ -12,9 +15,8 @@ function getToken() {
   return token;
 }
 
-async function linkedinFetch(path, options = {}) {
+async function linkedinFetch(url, options = {}) {
   const token = getToken();
-  const url = `${LINKEDIN_API}${path}`;
 
   const res = await fetch(url, {
     ...options,
@@ -28,7 +30,7 @@ async function linkedinFetch(path, options = {}) {
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`LinkedIn API ${path} → ${res.status}: ${body.substring(0, 200)}`);
+    throw new Error(`LinkedIn API ${url} → ${res.status}: ${body.substring(0, 200)}`);
   }
 
   return res;
@@ -38,23 +40,52 @@ async function linkedinFetch(path, options = {}) {
 
 /**
  * Retorna o URN do usuário autenticado.
- * Usa LINKEDIN_PERSON_URN se definido, senão busca via /v2/me.
- * Resultado é cacheado em memória.
+ * Ordem de resolução:
+ *   1. LINKEDIN_PERSON_URN (env)
+ *   2. Cache em memória
+ *   3. Cache no banco (linkedin_person_urn)
+ *   4. /v2/userinfo  (OpenID Connect — mais confiável)
+ *   5. /v2/me?projection=(id)  (fallback legado)
+ * Resultado persistido no banco para evitar chamadas extras.
  */
 async function getPersonUrn() {
+  // 1. env var manual
   if (process.env.LINKEDIN_PERSON_URN) {
     return process.env.LINKEDIN_PERSON_URN;
   }
 
+  // 2. cache em memória
   if (cachedPersonUrn) return cachedPersonUrn;
 
-  const res = await linkedinFetch('/me');
-  const data = await res.json();
+  // 3. cache no banco
+  const stored = await getSetting(DB_URN_KEY);
+  if (stored) {
+    cachedPersonUrn = stored;
+    return cachedPersonUrn;
+  }
 
+  // 4. tenta /userinfo (OpenID Connect)
+  try {
+    const res = await linkedinFetch('https://api.linkedin.com/v2/userinfo');
+    const data = await res.json();
+    if (data.sub) {
+      cachedPersonUrn = `urn:li:person:${data.sub}`;
+      await saveSetting(DB_URN_KEY, cachedPersonUrn);
+      console.log(`[linkedin] Person URN via /userinfo: ${cachedPersonUrn}`);
+      return cachedPersonUrn;
+    }
+  } catch (err) {
+    console.warn('[linkedin] /userinfo falhou, tentando /me:', err.message);
+  }
+
+  // 5. fallback: /me?projection=(id)
+  const res = await linkedinFetch(`${LINKEDIN_API}/me?projection=(id)`);
+  const data = await res.json();
   if (!data.id) throw new Error('LinkedIn /v2/me não retornou id');
 
   cachedPersonUrn = `urn:li:person:${data.id}`;
-  console.log(`[linkedin] Person URN: ${cachedPersonUrn}`);
+  await saveSetting(DB_URN_KEY, cachedPersonUrn);
+  console.log(`[linkedin] Person URN via /me: ${cachedPersonUrn}`);
   return cachedPersonUrn;
 }
 
@@ -81,7 +112,7 @@ async function publishPost(text) {
     },
   };
 
-  const res = await linkedinFetch('/ugcPosts', {
+  const res = await linkedinFetch(`${LINKEDIN_API}/ugcPosts`, {
     method: 'POST',
     body: JSON.stringify(body),
   });

@@ -3,19 +3,15 @@
 const { TwitterApi } = require('twitter-api-v2');
 
 const client = new TwitterApi({
-  appKey:      process.env.X_CLIENT_ID,
-  appSecret:   process.env.X_CLIENT_SECRET,
-  accessToken: process.env.X_ACCESS_TOKEN,
-  accessSecret: process.env.X_ACCESS_TOKEN_SECRET,
+  clientId:     process.env.X_CLIENT_ID,
+  clientSecret: process.env.X_CLIENT_SECRET,
 });
 
-const rwClient = client.readWrite;
+const userClient = new TwitterApi(process.env.X_ACCESS_TOKEN);
 
-console.log('[publisher] Inicializando cliente X com:', {
-  appKey:      process.env.X_CLIENT_ID              ? process.env.X_CLIENT_ID.substring(0, 8)              + '...' : 'AUSENTE',
-  appSecret:   process.env.X_CLIENT_SECRET          ? process.env.X_CLIENT_SECRET.substring(0, 8)          + '...' : 'AUSENTE',
-  accessToken: process.env.X_ACCESS_TOKEN           ? process.env.X_ACCESS_TOKEN.substring(0, 8)           + '...' : 'AUSENTE',
-  accessSecret: process.env.X_ACCESS_TOKEN_SECRET   ? process.env.X_ACCESS_TOKEN_SECRET.substring(0, 8)   + '...' : 'AUSENTE',
+console.log('[publisher] Inicializando cliente X (OAuth 2.0) com:', {
+  clientId:    process.env.X_CLIENT_ID    ? process.env.X_CLIENT_ID.substring(0, 8)    + '...' : 'AUSENTE',
+  accessToken: process.env.X_ACCESS_TOKEN ? process.env.X_ACCESS_TOKEN.substring(0, 8) + '...' : 'AUSENTE',
 });
 
 // ─────────────────────────────────────────────
@@ -23,8 +19,8 @@ console.log('[publisher] Inicializando cliente X com:', {
 // ─────────────────────────────────────────────
 
 async function publishTweet(text) {
-  const result = await client.v1.tweet(text);
-  return { id: result.id_str, raw: result };
+  const result = await userClient.v2.tweet({ text });
+  return { id: result.data.id, raw: result };
 }
 
 async function publishThread(tweets) {
@@ -38,15 +34,14 @@ async function publishThread(tweets) {
   const raws = [];
   for (let i = 0; i < tweets.length; i++) {
     const text = tweets[i];
-    const params = {};
+    const payload = { text };
     if (previousId) {
-      params.in_reply_to_status_id = previousId;
-      params.auto_populate_reply_metadata = true;
+      payload.reply = { in_reply_to_tweet_id: previousId };
     }
-    const result = await client.v1.tweet(text, params);
-    ids.push(result.id_str);
+    const result = await userClient.v2.tweet(payload);
+    ids.push(result.data.id);
     raws.push(result);
-    previousId = result.id_str;
+    previousId = result.data.id;
 
     // Pequena pausa entre tweets para evitar rate limit
     if (i < tweets.length - 1) {
@@ -62,16 +57,20 @@ async function publishPoll(text, options, durationMinutes = 1440) {
     throw new Error('Enquete precisa de pelo menos 2 opcoes');
   }
 
-  // v1.1 não suporta enquetes nativas — publica como tweet simples com opções no texto
+  // API do X aceita no máximo 4 opções, máx 25 chars cada
   const cleanOptions = options
     .slice(0, 4)
-    .map((o, i) => `${i + 1}. ${String(o).substring(0, 25)}`);
+    .map((o) => ({ label: String(o).substring(0, 25) }));
 
-  const fullText = `${text}\n\n${cleanOptions.join('\n')}`;
+  const result = await userClient.v2.tweet({
+    text,
+    poll: {
+      options: cleanOptions,
+      duration_minutes: durationMinutes,
+    },
+  });
 
-  const result = await client.v1.tweet(fullText.substring(0, 280));
-
-  return { id: result.id_str, raw: result };
+  return { id: result.data.id, raw: result };
 }
 
 // ─────────────────────────────────────────────

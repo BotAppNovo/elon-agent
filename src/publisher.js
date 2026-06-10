@@ -23,8 +23,8 @@ console.log('[publisher] Inicializando cliente X com:', {
 // ─────────────────────────────────────────────
 
 async function publishTweet(text) {
-  const result = await rwClient.v2.tweet({ text });
-  return { id: result.data.id, raw: result };
+  const result = await client.v1.tweet(text);
+  return { id: result.id_str, raw: result };
 }
 
 async function publishThread(tweets) {
@@ -36,18 +36,20 @@ async function publishThread(tweets) {
   let previousId = null;
 
   const raws = [];
-  for (const text of tweets) {
-    const payload = { text };
+  for (let i = 0; i < tweets.length; i++) {
+    const text = tweets[i];
+    const params = {};
     if (previousId) {
-      payload.reply = { in_reply_to_tweet_id: previousId };
+      params.in_reply_to_status_id = previousId;
+      params.auto_populate_reply_metadata = true;
     }
-    const result = await rwClient.v2.tweet(payload);
-    ids.push(result.data.id);
+    const result = await client.v1.tweet(text, params);
+    ids.push(result.id_str);
     raws.push(result);
-    previousId = result.data.id;
+    previousId = result.id_str;
 
     // Pequena pausa entre tweets para evitar rate limit
-    if (tweets.indexOf(text) < tweets.length - 1) {
+    if (i < tweets.length - 1) {
       await sleep(800);
     }
   }
@@ -60,20 +62,16 @@ async function publishPoll(text, options, durationMinutes = 1440) {
     throw new Error('Enquete precisa de pelo menos 2 opcoes');
   }
 
-  // API do X aceita no máximo 4 opções, máx 25 chars cada
+  // v1.1 não suporta enquetes nativas — publica como tweet simples com opções no texto
   const cleanOptions = options
     .slice(0, 4)
-    .map((o) => ({ label: String(o).substring(0, 25) }));
+    .map((o, i) => `${i + 1}. ${String(o).substring(0, 25)}`);
 
-  const result = await rwClient.v2.tweet({
-    text,
-    poll: {
-      options: cleanOptions,
-      duration_minutes: durationMinutes,
-    },
-  });
+  const fullText = `${text}\n\n${cleanOptions.join('\n')}`;
 
-  return { id: result.data.id, raw: result };
+  const result = await client.v1.tweet(fullText.substring(0, 280));
+
+  return { id: result.id_str, raw: result };
 }
 
 // ─────────────────────────────────────────────

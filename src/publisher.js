@@ -3,15 +3,19 @@
 const { TwitterApi } = require('twitter-api-v2');
 
 const client = new TwitterApi({
-  clientId:     process.env.X_CLIENT_ID,
-  clientSecret: process.env.X_CLIENT_SECRET,
+  appKey:       process.env.X_CLIENT_ID,
+  appSecret:    process.env.X_CLIENT_SECRET,
+  accessToken:  process.env.X_ACCESS_TOKEN,
+  accessSecret: process.env.X_ACCESS_TOKEN_SECRET,
 });
 
-const userClient = new TwitterApi(process.env.X_ACCESS_TOKEN);
+const rwClient = client.readWrite;
 
-console.log('[publisher] Inicializando cliente X (OAuth 2.0) com:', {
-  clientId:    process.env.X_CLIENT_ID    ? process.env.X_CLIENT_ID.substring(0, 8)    + '...' : 'AUSENTE',
-  accessToken: process.env.X_ACCESS_TOKEN ? process.env.X_ACCESS_TOKEN.substring(0, 8) + '...' : 'AUSENTE',
+console.log('[publisher] Inicializando cliente X com:', {
+  appKey:       process.env.X_CLIENT_ID              ? process.env.X_CLIENT_ID.substring(0, 8)              + '...' : 'AUSENTE',
+  appSecret:    process.env.X_CLIENT_SECRET          ? process.env.X_CLIENT_SECRET.substring(0, 8)          + '...' : 'AUSENTE',
+  accessToken:  process.env.X_ACCESS_TOKEN           ? process.env.X_ACCESS_TOKEN.substring(0, 8)           + '...' : 'AUSENTE',
+  accessSecret: process.env.X_ACCESS_TOKEN_SECRET    ? process.env.X_ACCESS_TOKEN_SECRET.substring(0, 8)    + '...' : 'AUSENTE',
 });
 
 // ─────────────────────────────────────────────
@@ -19,7 +23,7 @@ console.log('[publisher] Inicializando cliente X (OAuth 2.0) com:', {
 // ─────────────────────────────────────────────
 
 async function publishTweet(text) {
-  const result = await userClient.v2.tweet({ text });
+  const result = await rwClient.v2.tweet({ text });
   return { id: result.data.id, raw: result };
 }
 
@@ -38,7 +42,7 @@ async function publishThread(tweets) {
     if (previousId) {
       payload.reply = { in_reply_to_tweet_id: previousId };
     }
-    const result = await userClient.v2.tweet(payload);
+    const result = await rwClient.v2.tweet(payload);
     ids.push(result.data.id);
     raws.push(result);
     previousId = result.data.id;
@@ -62,7 +66,7 @@ async function publishPoll(text, options, durationMinutes = 1440) {
     .slice(0, 4)
     .map((o) => ({ label: String(o).substring(0, 25) }));
 
-  const result = await userClient.v2.tweet({
+  const result = await rwClient.v2.tweet({
     text,
     poll: {
       options: cleanOptions,

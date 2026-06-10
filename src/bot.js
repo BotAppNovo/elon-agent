@@ -18,6 +18,9 @@ const X_USERNAME = process.env.X_USERNAME || null;
 // postId -> { post, source, messageId }
 const pendingApprovals = new Map();
 
+// liId -> { text, messageId }
+const linkedinPendingApprovals = new Map();
+
 // chatId -> { postId, step: 'awaiting_edit' | 'awaiting_feedback' }
 const editingState = new Map();
 
@@ -57,6 +60,15 @@ function approveOnlyKeyboard(postId) {
   };
 }
 
+function linkedinKeyboard(liId) {
+  return {
+    inline_keyboard: [[
+      { text: '✅ Aprovar LinkedIn', callback_data: `approve_li:${liId}` },
+      { text: '❌ Descartar', callback_data: `discard_li:${liId}` },
+    ]],
+  };
+}
+
 function linkedinEnabled() {
   return !!process.env.LINKEDIN_ACCESS_TOKEN;
 }
@@ -73,42 +85,51 @@ async function doPublish(post, source) {
   console.log('[bot] Resposta da API do X — IDs publicados:', xIds);
   console.log('[bot] Resposta raw da API do X:', JSON.stringify(xRaw, null, 2));
 
-  // Publica no LinkedIn (opcional — falha silenciosa para não bloquear X)
-  let linkedinPostId = null;
-  if (linkedinEnabled()) {
-    try {
-      const liText = await generateLinkedInVersion(post);
-      linkedinPostId = await publishLinkedIn(liText);
-      console.log('[bot] LinkedIn publicado — ID:', linkedinPostId);
-    } catch (err) {
-      console.error('[bot] LinkedIn publish falhou (X ok):', err.message);
-    }
-  }
-
   await savePost({
     content: postToStorableContent(post),
     format: post.format,
     tweet_ids: xIds,
     source,
-    linkedin_post_id: linkedinPostId,
+    linkedin_post_id: null,
   });
 
-  return { xIds, linkedinPostId };
+  return { xIds };
 }
 
-function buildPublishedMessage(post, xIds, linkedinPostId) {
+function buildPublishedMessage(post, xIds) {
   const preview = formatPostPreview(post);
   const xUrl = tweetUrl(xIds[0], X_USERNAME);
+  return `✅ <b>Publicado no X!</b>\n\n${preview}\n\n<a href="${xUrl}">Ver no X</a>`;
+}
 
-  let msg = `✅ <b>Publicado!</b>\n\n${preview}\n\n`;
-  msg += `<a href="${xUrl}">Ver no X</a>`;
+// ─── Fluxo LinkedIn (sempre por aprovação, nunca automático) ──────────────────
 
-  if (linkedinPostId) {
-    const liUrl = linkedinPostUrl(linkedinPostId);
-    msg += ` · <a href="${liUrl}">Ver no LinkedIn</a>`;
+async function sendLinkedInForApproval(liText) {
+  const liId = newPostId();
+  const preview = escHtml(liText.length > 500 ? liText.substring(0, 500) + '…' : liText);
+
+  const message = await bot.telegram.sendMessage(
+    OWNER_CHAT_ID,
+    `🔗 <b>Post LinkedIn para aprovação:</b>\n\n${preview}`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: linkedinKeyboard(liId),
+    }
+  );
+
+  linkedinPendingApprovals.set(liId, { text: liText, messageId: message.message_id });
+  return message;
+}
+
+async function queueLinkedInAfterX(post) {
+  if (!linkedinEnabled()) return;
+  try {
+    const liText = await generateLinkedInVersion(post);
+    await sendLinkedInForApproval(liText);
+    console.log('[bot] Versão LinkedIn enviada para aprovação.');
+  } catch (err) {
+    console.error('[bot] Erro ao gerar versão LinkedIn após X:', err.message);
   }
-
-  return msg;
 }
 
 // ─── sendForApproval — usado pelo scheduler e por comandos manuais ────────────
@@ -373,16 +394,19 @@ bot.action(/^approve:(.+)$/, async (ctx) => {
   }
 
   try {
-    const { xIds, linkedinPostId } = await doPublish(pending.post, pending.source);
+    const { xIds } = await doPublish(pending.post, pending.source);
     pendingApprovals.delete(postId);
 
     console.log(`[bot] Publicação concluída — tweet IDs: ${xIds.join(', ')}`);
 
-    const successMsg = buildPublishedMessage(pending.post, xIds, linkedinPostId);
+    const successMsg = buildPublishedMessage(pending.post, xIds);
     await ctx.editMessageText(successMsg, {
       parse_mode: 'HTML',
       disable_web_page_preview: false,
     }).catch(() => {});
+
+    // Gera versão LinkedIn e envia para aprovação separada (não bloqueia)
+    queueLinkedInAfterX(pending.post).catch(() => {});
   } catch (err) {
     console.error('[bot] Erro ao publicar — mensagem:', err.message);
     console.error('[bot] Erro ao publicar — stack:\n', err.stack);
@@ -433,6 +457,48 @@ bot.action(/^discard:(.+)$/, async (ctx) => {
   await ctx.editMessageText('❌ Post descartado.').catch(() => {});
 });
 
+// Aprovar LinkedIn
+bot.action(/^approve_li:(.+)$/, async (ctx) => {
+  const liId = ctx.match[1];
+  await ctx.answerCbQuery('Publicando no LinkedIn...').catch(() => {});
+
+  const pending = linkedinPendingApprovals.get(liId);
+  if (!pending) {
+    return ctx.editMessageText('❌ Post LinkedIn não encontrado (bot pode ter reiniciado).').catch(() => {});
+  }
+
+  try {
+    const linkedinPostId = await publishLinkedIn(pending.text);
+    linkedinPendingApprovals.delete(liId);
+    console.log('[bot] LinkedIn publicado — ID:', linkedinPostId);
+
+    const liUrl = linkedinPostUrl(linkedinPostId);
+    await ctx.editMessageText(
+      `✅ <b>Publicado no LinkedIn!</b>\n\n<a href="${liUrl}">Ver no LinkedIn</a>`,
+      { parse_mode: 'HTML', disable_web_page_preview: false }
+    ).catch(() => {});
+  } catch (err) {
+    console.error('[bot] Erro ao publicar no LinkedIn:', err.message);
+    console.error('[bot] Stack:\n', err.stack);
+
+    const errMsg =
+      `❌ <b>Falha ao publicar no LinkedIn</b>\n\n` +
+      `<b>Erro:</b> ${escHtml(err.message)}\n\n` +
+      `<i>Verifique os logs do servidor para o stack trace completo.</i>`;
+
+    await ctx.editMessageText(errMsg, { parse_mode: 'HTML' }).catch(() => {});
+    await bot.telegram.sendMessage(OWNER_CHAT_ID, errMsg, { parse_mode: 'HTML' }).catch(() => {});
+  }
+});
+
+// Descartar LinkedIn
+bot.action(/^discard_li:(.+)$/, async (ctx) => {
+  const liId = ctx.match[1];
+  await ctx.answerCbQuery('Descartado').catch(() => {});
+  linkedinPendingApprovals.delete(liId);
+  await ctx.editMessageText('❌ Post LinkedIn descartado.').catch(() => {});
+});
+
 // ─── Handlers internos ────────────────────────────────────────────────────────
 
 async function handleGeneratedPost(ctx, post, source) {
@@ -440,9 +506,11 @@ async function handleGeneratedPost(ctx, post, source) {
 
   if (isAuto) {
     try {
-      const { xIds, linkedinPostId } = await doPublish(post, source);
-      const msg = buildPublishedMessage(post, xIds, linkedinPostId);
+      const { xIds } = await doPublish(post, source);
+      const msg = buildPublishedMessage(post, xIds);
       await ctx.replyWithHTML(msg, { disable_web_page_preview: false });
+      // Gera versão LinkedIn e envia para aprovação separada (não bloqueia)
+      queueLinkedInAfterX(post).catch(() => {});
     } catch (err) {
       ctx.replyWithHTML(`❌ <b>Erro ao publicar:</b> ${escHtml(err.message)}`);
     }
@@ -476,4 +544,4 @@ async function launch() {
   await bot.launch();
 }
 
-module.exports = { bot, launch, sendForApproval, pendingApprovals };
+module.exports = { bot, launch, sendForApproval, sendLinkedInForApproval, pendingApprovals };

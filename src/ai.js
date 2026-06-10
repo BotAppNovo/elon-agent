@@ -260,39 +260,107 @@ function postToText(post) {
 }
 
 // ─────────────────────────────────────────────
-// Versão LinkedIn (expandida)
+// System prompt LinkedIn
+// ─────────────────────────────────────────────
+
+const LINKEDIN_SYSTEM_PROMPT = `Você escreve posts para a página do Myndit no LinkedIn.
+
+SOBRE O MYNDIT:
+O Myndit é a primeira ferramenta brasileira de memória externa cognitiva. Slogan: "Eu lembro por você." Não é app de lembretes — é transferência real de responsabilidade cognitiva. O app insiste até o usuário resolver a pendência. 3 modos de intensidade: Padrão, Moderado, Intenso.
+
+PÚBLICO:
+Empresário PME, advogado, médico com consultório próprio, consultor autônomo. 28–45 anos. Gerencia a própria agenda sem assistente. Usa WhatsApp, alarme ou bloco de notas como gambiarra para não esquecer.
+
+TOM DE VOZ:
+Sóbrio, humano, direto. Como um assistente discreto e confiante. Sem exclamações, sem emojis, sem jargão de produtividade ou wellness. O leitor deve sentir que o produto entende o problema dele.
+
+NUNCA USE:
+- "revolucionário", "inovador", "disruptivo", "paz mental"
+- Linguagem de saúde mental ou terapia
+- Gamificação, contadores, desafios
+- Textos genéricos de produtividade que poderiam ser de qualquer marca
+- Urgência artificial
+- Emojis
+
+ESTRUTURA DOS POSTS:
+- Comece sempre com a dor — nunca com o produto
+- 80 a 200 palavras
+- Parágrafos curtos, máximo 2 linhas cada
+- Mencione o Myndit apenas no final, se fizer sentido orgânico
+- Máximo 1 menção ao Myndit por post
+
+EXEMPLO DE POST BOM:
+"A maioria das pessoas tem pelo menos três sistemas para não esquecer as coisas.
+
+Um alarme no celular. Uma mensagem para si mesmo no WhatsApp. Um post-it no monitor.
+
+E ainda assim esquecem.
+
+Não é falta de organização. É que nenhuma dessas gambiarras insiste. Elas avisam uma vez — e somem.
+
+O Myndit não some. Ele lembra até você resolver. Depois para, sem culpa.
+
+Cabeça mais leve. Todo dia."
+
+TEMAS PARA VARIAR:
+1. Espelho da dor — situações específicas que o público vive (a ligação esquecida, a tarefa que ficou na cabeça três dias, o loop mental de "não posso esquecer disso")
+2. Diferenciação — por que lembrete comum não resolve, a diferença entre ser avisado uma vez e ter algo que insiste com calma
+3. Prova — como o app funciona na prática, bastidores do produto`;
+
+// ─────────────────────────────────────────────
+// LinkedIn — versão adaptada do post do X
 // ─────────────────────────────────────────────
 
 /**
- * Recebe o post do X (já gerado) e retorna uma versão expandida para o LinkedIn.
- * LinkedIn suporta até 3.000 chars. Visamos 800–1.500.
+ * Recebe o post do X (já publicado) e gera uma versão original para o LinkedIn
+ * com o mesmo tema, usando o tom e as regras do LINKEDIN_SYSTEM_PROMPT.
  */
 async function generateLinkedInVersion(xPost) {
   const xText = postToText(xPost);
 
   const userMessage =
-    `Post publicado no X:\n${xText}\n\n` +
-    `Adapte este post para o LinkedIn. Regras:\n` +
-    `1. Mesma voz do Ícaro — 1ª pessoa, direto, sem enrolação\n` +
-    `2. Primeira linha ainda mais forte (é o que aparece antes do "ver mais")\n` +
-    `3. Expanda a ideia central em 3–4 parágrafos curtos com quebra de linha entre eles\n` +
-    `4. Mais contexto e profundidade que no X, mas sem virar artigo acadêmico\n` +
-    `5. ZERO hashtags\n` +
-    `6. Termine com uma frase que convida reflexão ou comentário\n` +
-    `7. Máximo 1500 caracteres\n\n` +
+    `O Myndit acabou de publicar este conteúdo no X:\n\n${xText}\n\n` +
+    `Com base no mesmo tema, escreva um post original para o LinkedIn seguindo exatamente as regras do seu prompt.\n` +
+    `Não copie o texto do X — escreva de forma independente, com a profundidade e o tom adequados ao LinkedIn.\n\n` +
     `Retorne APENAS o texto do post. Sem JSON, sem aspas, sem markdown, sem explicação.`;
 
   const response = await getClient().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: LINKEDIN_SYSTEM_PROMPT },
       { role: 'user', content: userMessage },
     ],
     temperature: 0.85,
-    max_tokens: 700,
+    max_tokens: 600,
   });
 
-  return response.choices[0].message.content.trim().substring(0, 1500);
+  return response.choices[0].message.content.trim().substring(0, 3000);
 }
 
-module.exports = { generatePost, improvePost, generateLinkedInVersion };
+// ─────────────────────────────────────────────
+// LinkedIn — post autônomo (sem base em X)
+// ─────────────────────────────────────────────
+
+/**
+ * Gera um post original para o LinkedIn sem base em nenhum post do X.
+ * Usado pelo cron de segundas, quartas e sextas às 9h.
+ */
+async function generateLinkedInPost() {
+  const userMessage =
+    `Escreva um post original para o LinkedIn seguindo exatamente as regras do seu prompt.\n\n` +
+    `Retorne APENAS o texto do post. Sem JSON, sem aspas, sem markdown, sem explicação.`;
+
+  const response = await getClient().chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: LINKEDIN_SYSTEM_PROMPT },
+      { role: 'user', content: userMessage },
+    ],
+    temperature: 0.85,
+    max_tokens: 600,
+  });
+
+  return response.choices[0].message.content.trim().substring(0, 3000);
+}
+
+module.exports = { generatePost, improvePost, generateLinkedInVersion, generateLinkedInPost };

@@ -8,7 +8,6 @@ const {
   saveSetting,
   isTweetSuggested,
   saveSuggestedTweet,
-  markTweetReplied,
   markTweetSkipped,
 } = require('./db');
 const { escHtml } = require('./utils');
@@ -33,7 +32,7 @@ function getOpenAI() {
 
 // ─── Estado em memória ────────────────────────────────────────────────────────
 
-// copilotId -> { tweetId, tweetText, tweetUrl, metrics, suggestedReply, quoteText, messageId }
+// copilotId -> { tweetId, tweetText, tweetUrl, authorUsername, metrics, suggestedReply, quoteText, quoteIntentUrl, messageId }
 const copilotPendingApprovals = new Map();
 
 const OWNER_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -170,12 +169,17 @@ function buildIntentUrl(tweetId, replyText) {
   return `https://x.com/intent/post?in_reply_to=${tweetId}&text=${encodeURIComponent(replyText)}`;
 }
 
-function copilotKeyboard(copilotId, intentUrl) {
+function buildQuoteIntentUrl(tweetId, authorUsername, quoteText) {
+  const originalUrl = `https://x.com/${authorUsername}/status/${tweetId}`;
+  return `https://x.com/intent/post?text=${encodeURIComponent(quoteText + ' ' + originalUrl)}`;
+}
+
+function copilotKeyboard(copilotId, intentUrl, quoteIntentUrl) {
   return {
     inline_keyboard: [
       [
         { text: '💬 Responder no X', url: intentUrl },
-        { text: '🔁 Citar',          callback_data: `copilot_quote:${copilotId}` },
+        { text: '🔁 Citar no X',     url: quoteIntentUrl },
       ],
       [
         { text: '✏️ Editar', callback_data: `copilot_edit:${copilotId}` },
@@ -328,10 +332,12 @@ async function runCopilotSearch(telegram) {
   for (const tweet of tweets) {
     try {
       const author = usersMap[tweet.author_id];
-      const tweetUrl = `https://x.com/${author?.username || 'i/web'}/status/${tweet.id}`;
+      const authorUsername = author?.username || 'i/web';
+      const tweetUrl = `https://x.com/${authorUsername}/status/${tweet.id}`;
       const suggestedReply = await generateReply(tweet.text);
       const quoteText = await generateQuote(tweet.text);
       const intentUrl = buildIntentUrl(tweet.id, suggestedReply);
+      const quoteIntentUrl = buildQuoteIntentUrl(tweet.id, authorUsername, quoteText);
 
       await saveSuggestedTweet(tweet.id, suggestedReply);
 
@@ -343,7 +349,7 @@ async function runCopilotSearch(telegram) {
         {
           parse_mode: 'HTML',
           disable_web_page_preview: true,
-          reply_markup: copilotKeyboard(copilotId, intentUrl),
+          reply_markup: copilotKeyboard(copilotId, intentUrl, quoteIntentUrl),
         }
       );
 
@@ -351,9 +357,11 @@ async function runCopilotSearch(telegram) {
         tweetId: tweet.id,
         tweetText: tweet.text,
         tweetUrl,
+        authorUsername,
         metrics: tweet.public_metrics,
         suggestedReply,
         quoteText,
+        quoteIntentUrl,
         messageId: message.message_id,
       });
 
@@ -362,17 +370,6 @@ async function runCopilotSearch(telegram) {
       console.error(`[copilot] Erro ao processar tweet ${tweet.id}:`, err.message);
     }
   }
-}
-
-// ─── Publicar quote tweet ─────────────────────────────────────────────────────
-
-async function quoteTweet(tweetId, quoteText) {
-  const id = String(tweetId); // IDs do X perdem precisão como número
-  const result = await rwClient.v2.tweet(quoteText, {
-    quote_tweet_id: id,
-  });
-  await markTweetReplied(id, result.data.id);
-  return result.data;
 }
 
 async function skipTweet(tweetId) {
@@ -402,6 +399,6 @@ module.exports = {
   copilotKeyboard,
   buildSuggestionMessage,
   buildIntentUrl,
-  quoteTweet,
+  buildQuoteIntentUrl,
   skipTweet,
 };

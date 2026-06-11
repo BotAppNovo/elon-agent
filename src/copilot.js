@@ -5,6 +5,7 @@ const { TwitterApi } = require('twitter-api-v2');
 const OpenAI = require('openai');
 const {
   getSetting,
+  saveSetting,
   isTweetSuggested,
   saveSuggestedTweet,
   markTweetReplied,
@@ -38,39 +39,65 @@ const copilotPendingApprovals = new Map();
 const OWNER_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const X_USERNAME = process.env.X_USERNAME || null;
 
-// ─── Grupos de palavras-chave (rotação a cada busca) ─────────────────────────
+// ─── 12 grupos de palavras-chave (rotação persistida no banco) ────────────────
+// Cada grupo vira: (keywords) lang:pt -is:retweet -is:reply
+// Todas as queries ficam bem abaixo do limite de 512 chars da API do X.
 
 const KEYWORD_GROUPS = [
-  'produtividade',
-  'esquecer OR esqueci',
-  'carga mental',
-  'rotina corrida',
-  'ansiedade tarefas',
-  'memória cheia',
+  // A — Esquecimento
+  '"esqueci" OR "quase esqueci" OR "ia esquecer" OR "esqueci de novo" OR "vivo esquecendo" OR "esqueço tudo" OR "tinha esquecido" OR "esqueci completamente"',
+  // B — Memória
+  '"memória de peixe" OR "memória péssima" OR "minha memória ta" OR "não lembro de nada" OR "lembrei agora" OR "só lembrei depois" OR "lembrei tarde" OR "memória horrível"',
+  // C — Sobrecarga
+  '"cabeça cheia" OR "mente cheia" OR "mil coisas" OR "não dou conta" OR "sobrecarregada" OR "sobrecarregado" OR "pensando em mil coisas" OR "muita coisa na cabeça"',
+  // D — Procrastinação
+  '"procrastinando" OR "procrastinação" OR "deixei pra depois" OR "empurrando com a barriga" OR "enrolando pra fazer" OR "preguiça de fazer" OR "depois eu faço" OR "adiando isso"',
+  // E — Tarefas
+  '"lista de tarefas" OR "to do list" OR "pendências" OR "tarefas acumuladas" OR "checklist" OR "tanta coisa pendente" OR "tarefas atrasadas" OR "lista enorme"',
+  // F — Rotina
+  '"rotina corrida" OR "dia corrido" OR "semana lotada" OR "agenda lotada" OR "correria" OR "dia cheio" OR "não paro um minuto" OR "sem tempo pra nada"',
+  // G — Mente acelerada
+  '"mente não desliga" OR "cabeça não para" OR "pensamento acelerado" OR "não consigo relaxar" OR "mente a mil" OR "cérebro não desliga" OR "cabeça a mil" OR "não desligo"',
+  // H — Compromissos perdidos
+  '"esqueci a reunião" OR "perdi o prazo" OR "esqueci o boleto" OR "esqueci a consulta" OR "perdi a consulta" OR "esqueci de pagar" OR "esqueci de responder" OR "esqueci o aniversário"',
+  // I — Gambiarras de memória
+  '"alarme no celular" OR "lembrete no celular" OR "post-it" OR "bloco de notas" OR "mandei mensagem pra mim" OR "anotar pra não esquecer" OR "vários alarmes" OR "anotei e esqueci"',
+  // J — Noite / insônia
+  '"acordei lembrando" OR "não consigo dormir pensando" OR "deitei e lembrei" OR "madrugada pensando" OR "lembrei na hora de dormir" OR "insônia pensando" OR "acordei às 3" OR "pensando antes de dormir"',
+  // K — Desabafo de produtividade
+  '"produtividade zero" OR "dia improdutivo" OR "não rendi nada" OR "não fiz nada hoje" OR "travada" OR "travado no trabalho" OR "foco zero" OR "sem foco nenhum"',
+  // L — Organização
+  '"me organizar" OR "preciso me organizar" OR "desorganizada" OR "desorganizado" OR "tentando me organizar" OR "organizar minha vida" OR "vida uma bagunça" OR "tudo bagunçado"',
 ];
-let keywordGroupIndex = 0;
 
-// ─── Filtro de relevância via IA ──────────────────────────────────────────────
+// Tentativas em cascata — máx. 3 por execução
+const CASCADE_ATTEMPTS = [
+  { hoursBack: 12, minLikes: 50, minRts: 10, flexible: false }, // tentativa 1
+  { hoursBack: 24, minLikes: 20, minRts: 5,  flexible: false }, // tentativa 2
+  { hoursBack: 24, minLikes: 5,  minRts: 0,  flexible: true  }, // tentativa 3 (modo flexível)
+];
 
-async function isRelevant(tweetText) {
+// ─── Filtro de relevância por nota (0–10) ────────────────────────────────────
+
+async function scoreRelevance(tweetText) {
   const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       {
         role: 'user',
         content:
-          `Avalie se este tweet tem relação REAL com os temas: produtividade pessoal, ` +
-          `esquecimento de tarefas, sobrecarga mental, rotina corrida, organização pessoal, ` +
-          `ansiedade por pendências. Tweets sobre política, economia, notícias, esportes ou ` +
-          `qualquer tema que apenas mencione essas palavras em outro contexto devem ser REJEITADOS. ` +
-          `Responda apenas APROVADO ou REJEITADO.\n\nTweet: "${tweetText}"`,
+          `Dê uma nota de 0 a 10 para o quanto este tweet expressa uma experiência PESSOAL com: ` +
+          `esquecimento, sobrecarga mental, procrastinação, rotina corrida ou pendências acumuladas. ` +
+          `Tweets sobre política, economia, notícias ou esportes = nota 0. ` +
+          `Responda apenas o número.\n\nTweet: "${tweetText}"`,
       },
     ],
-    max_tokens: 10,
+    max_tokens: 5,
     temperature: 0,
   });
-  const verdict = (response.choices[0].message.content || '').trim().toUpperCase();
-  return verdict.includes('APROVADO');
+  const raw = (response.choices[0].message.content || '').trim();
+  const score = parseFloat(raw);
+  return isNaN(score) ? 0 : Math.min(10, Math.max(0, score));
 }
 
 // ─── Geração da resposta ─────────────────────────────────────────────────────
@@ -131,20 +158,11 @@ function buildSuggestionMessage(tweetText, tweetUrl, metrics, suggestedReply, ed
   );
 }
 
-// ─── Busca principal ─────────────────────────────────────────────────────────
+// ─── Busca individual (uma tentativa da cascata) ──────────────────────────────
 
-async function runCopilotSearch(telegram) {
-  const enabled = (await getSetting('copilot_enabled')) !== 'false';
-  if (!enabled) {
-    console.log('[copilot] Desativado — busca ignorada.');
-    return;
-  }
-
-  const keywords = KEYWORD_GROUPS[keywordGroupIndex % KEYWORD_GROUPS.length];
-  keywordGroupIndex = (keywordGroupIndex + 1) % KEYWORD_GROUPS.length;
-
+async function fetchAndFilter(keywords, hoursBack, minLikes, minRts) {
   const query = `(${keywords}) lang:pt -is:retweet -is:reply`;
-  console.log(`[copilot] Buscando: ${query}`);
+  console.log(`[copilot] Buscando (${hoursBack}h, >=/${minLikes} likes ou >=${minRts} RTs): ${query}`);
 
   const response = await rwClient.v2.search(query, {
     max_results: 20,
@@ -157,16 +175,13 @@ async function runCopilotSearch(telegram) {
   const usersMap = {};
   (response.data?.includes?.users || []).forEach((u) => { usersMap[u.id] = u; });
 
-  // Filtro: últimas 12h + engajamento mínimo
-  const cutoff = new Date(Date.now() - 12 * 60 * 60 * 1000);
+  const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
   const filtered = tweets.filter((t) => {
-    const created = new Date(t.created_at);
-    if (created < cutoff) return false;
+    if (new Date(t.created_at) < cutoff) return false;
     const m = t.public_metrics;
-    return m.like_count >= 50 || (m.retweet_count + (m.quote_count || 0)) >= 10;
+    return m.like_count >= minLikes || (m.retweet_count + (m.quote_count || 0)) >= minRts;
   });
 
-  // Ordenar por engajamento (likes + 3× RTs/quotes)
   filtered.sort((a, b) => {
     const score = (t) =>
       t.public_metrics.like_count +
@@ -182,33 +197,95 @@ async function runCopilotSearch(telegram) {
   }
 
   console.log(
-    `[copilot] ${tweets.length} encontrados → ${filtered.length} elegíveis → ${selected.length} selecionados`
+    `[copilot] ${tweets.length} encontrados -> ${filtered.length} elegiveis -> ${selected.length} candidatos`
   );
 
-  // Filtro de relevância via IA
-  const relevant = [];
-  for (const tweet of selected) {
-    try {
-      const ok = await isRelevant(tweet.text);
-      console.log(`[copilot] Tweet ${tweet.id} — ${ok ? 'APROVADO' : 'REJEITADO'} pela IA`);
-      if (ok) relevant.push(tweet);
-    } catch (err) {
-      console.error(`[copilot] Erro ao avaliar relevância do tweet ${tweet.id}:`, err.message);
-      relevant.push(tweet); // em caso de falha da IA, não bloquear
-    }
+  return { selected, usersMap };
+}
+
+// ─── Busca principal em cascata ───────────────────────────────────────────────
+
+async function runCopilotSearch(telegram) {
+  const enabled = (await getSetting('copilot_enabled')) !== 'false';
+  if (!enabled) {
+    console.log('[copilot] Desativado — busca ignorada.');
+    return;
   }
 
-  if (relevant.length === 0) {
-    console.log('[copilot] Nenhum tweet relevante após filtro de IA.');
+  // Ler índice persistido; avança a cada tentativa para nunca repetir grupos
+  const rawIdx = await getSetting('copilot_keyword_index');
+  let idx = rawIdx !== null ? parseInt(rawIdx, 10) : 0;
+  if (isNaN(idx) || idx < 0) idx = 0;
+
+  let approvedTweets = null; // { tweets, usersMap }
+
+  for (let attempt = 0; attempt < CASCADE_ATTEMPTS.length; attempt++) {
+    const { hoursBack, minLikes, minRts, flexible } = CASCADE_ATTEMPTS[attempt];
+    const keywords = KEYWORD_GROUPS[idx % KEYWORD_GROUPS.length];
+
+    // Avança e persiste o índice ANTES de tentar (garante progresso mesmo em erro)
+    idx = (idx + 1) % KEYWORD_GROUPS.length;
+    await saveSetting('copilot_keyword_index', String(idx));
+
+    let selected, usersMap;
+    try {
+      ({ selected, usersMap } = await fetchAndFilter(keywords, hoursBack, minLikes, minRts));
+    } catch (err) {
+      console.error(`[copilot] Erro na tentativa ${attempt + 1}:`, err.message);
+      continue;
+    }
+
+    if (selected.length === 0) {
+      console.log(`[copilot] Tentativa ${attempt + 1}: nenhum candidato apos filtros de engajamento.`);
+      continue;
+    }
+
+    // Filtro de relevância por nota
+    const relevant = [];
+    for (const tweet of selected) {
+      let score = 6; // fallback otimista em caso de falha da IA
+      try {
+        score = await scoreRelevance(tweet.text);
+      } catch (err) {
+        console.error(`[copilot] Erro ao pontuar tweet ${tweet.id}:`, err.message);
+      }
+      const modeLabel = flexible ? ' (modo flexivel)' : '';
+      console.log(`[copilot] Tweet ${tweet.id} — nota ${score}${modeLabel}`);
+
+      if (score >= 6) {
+        relevant.push(tweet);
+      } else if (flexible && score >= 4) {
+        relevant.push(tweet); // aceita nota 4-5 apenas na tentativa 3
+      }
+    }
+
+    if (relevant.length > 0) {
+      approvedTweets = { tweets: relevant, usersMap };
+      console.log(
+        `[copilot] Tentativa ${attempt + 1}: ${relevant.length} tweet(s) aprovado(s) — cascata encerrada.`
+      );
+      break;
+    }
+
+    console.log(`[copilot] Tentativa ${attempt + 1}: nenhum tweet passou o filtro de relevancia.`);
+  }
+
+  if (!approvedTweets) {
+    console.log('[copilot] Cascata encerrada sem candidatos fortes.');
     if (telegram && OWNER_CHAT_ID) {
       await telegram
-        .sendMessage(OWNER_CHAT_ID, '🔍 Nenhum tweet relevante encontrado nesta busca.')
+        .sendMessage(
+          OWNER_CHAT_ID,
+          '🔍 Busca concluída sem candidatos fortes. Próxima tentativa automática no horário do cron.'
+        )
         .catch(() => {});
     }
     return;
   }
 
-  for (const tweet of relevant) {
+  const { tweets, usersMap } = approvedTweets;
+
+  for (const tweet of tweets) {
     try {
       const author = usersMap[tweet.author_id];
       const tweetUrl = `https://x.com/${author?.username || 'i/web'}/status/${tweet.id}`;

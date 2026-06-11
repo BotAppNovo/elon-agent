@@ -1,12 +1,32 @@
 'use strict';
 
 const { Telegraf } = require('telegraf');
-const { generatePost, improvePost, generateLinkedInVersion } = require('./ai');
+const { generatePost, improvePost } = require('./ai');
 const { publish, normalizeIds, rawResponse, tweetUrl } = require('./publisher');
-const { publishPost: publishLinkedIn, linkedinPostUrl } = require('./linkedin');
-const { savePost, getSetting, saveSetting, saveContext, listContexts, getRecentPosts, clearContexts, getRssSources, saveRssSource, removeRssSource } = require('./db');
+const {
+  savePost,
+  getSetting,
+  saveSetting,
+  saveContext,
+  listContexts,
+  getRecentPosts,
+  clearContexts,
+  getRssSources,
+  saveRssSource,
+  removeRssSource,
+  markTweetSkipped,
+} = require('./db');
 const { DEFAULT_SOURCES } = require('./research');
 const { formatPostPreview, getNextScheduledPost, parseEditedText, postToStorableContent, escHtml } = require('./utils');
+const {
+  startCopilot,
+  runCopilotSearch,
+  copilotPendingApprovals,
+  copilotKeyboard,
+  buildSuggestionMessage,
+  replyTweet,
+  skipTweet,
+} = require('./copilot');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -18,10 +38,7 @@ const X_USERNAME = process.env.X_USERNAME || null;
 // postId -> { post, source, messageId }
 const pendingApprovals = new Map();
 
-// liId -> { text, messageId }
-const linkedinPendingApprovals = new Map();
-
-// chatId -> { postId, step: 'awaiting_edit' | 'awaiting_feedback' }
+// chatId -> { postId?, copilotId?, step }
 const editingState = new Map();
 
 // ─── Middleware de segurança ─────────────────────────────────────────────────
@@ -60,19 +77,6 @@ function approveOnlyKeyboard(postId) {
   };
 }
 
-function linkedinKeyboard(liId) {
-  return {
-    inline_keyboard: [[
-      { text: '✅ Aprovar LinkedIn', callback_data: `approve_li:${liId}` },
-      { text: '❌ Descartar', callback_data: `discard_li:${liId}` },
-    ]],
-  };
-}
-
-function linkedinEnabled() {
-  return !!process.env.LINKEDIN_ACCESS_TOKEN;
-}
-
 async function doPublish(post, source) {
   console.log('[bot] Iniciando publicação no X...');
   console.log('[bot] Formato:', post.format);
@@ -100,36 +104,6 @@ function buildPublishedMessage(post, xIds) {
   const preview = formatPostPreview(post);
   const xUrl = tweetUrl(xIds[0], X_USERNAME);
   return `✅ <b>Publicado no X!</b>\n\n${preview}\n\n<a href="${xUrl}">Ver no X</a>`;
-}
-
-// ─── Fluxo LinkedIn (sempre por aprovação, nunca automático) ──────────────────
-
-async function sendLinkedInForApproval(liText) {
-  const liId = newPostId();
-  const preview = escHtml(liText.length > 500 ? liText.substring(0, 500) + '…' : liText);
-
-  const message = await bot.telegram.sendMessage(
-    OWNER_CHAT_ID,
-    `🔗 <b>Post LinkedIn para aprovação:</b>\n\n${preview}`,
-    {
-      parse_mode: 'HTML',
-      reply_markup: linkedinKeyboard(liId),
-    }
-  );
-
-  linkedinPendingApprovals.set(liId, { text: liText, messageId: message.message_id });
-  return message;
-}
-
-async function queueLinkedInAfterX(post) {
-  if (!linkedinEnabled()) return;
-  try {
-    const liText = await generateLinkedInVersion(post);
-    await sendLinkedInForApproval(liText);
-    console.log('[bot] Versão LinkedIn enviada para aprovação.');
-  } catch (err) {
-    console.error('[bot] Erro ao gerar versão LinkedIn após X:', err.message);
-  }
 }
 
 // ─── sendForApproval — usado pelo scheduler e por comandos manuais ────────────
@@ -165,7 +139,9 @@ bot.command('start', (ctx) => {
     `/contexto [texto] — Adicionar contexto ao agente\n` +
     `/historico — Ver últimos 5 posts publicados\n` +
     `/limpar_contextos — Remove todos os contextos salvos\n` +
-    `/fontes — Ver e gerenciar fontes de RSS`
+    `/fontes — Ver e gerenciar fontes de RSS\n` +
+    `/copilot on|off — Liga/desliga buscas de resposta\n` +
+    `/copilot agora — Força busca imediata`
   );
 });
 
@@ -193,14 +169,47 @@ bot.command('auto', async (ctx) => {
   }
 });
 
+bot.command('copilot', async (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  const action = (args[0] || '').toLowerCase();
+
+  if (action === 'on') {
+    await saveSetting('copilot_enabled', 'true');
+    ctx.replyWithHTML(`🟢 <b>Copiloto ATIVADO</b>\nBuscas automáticas às 11h e 19h (Brasília).`);
+  } else if (action === 'off') {
+    await saveSetting('copilot_enabled', 'false');
+    ctx.replyWithHTML(`🔴 <b>Copiloto DESATIVADO</b>\nBuscas automáticas pausadas.`);
+  } else if (action === 'agora') {
+    const loadingMsg = await ctx.reply('🔍 Buscando tweets...');
+    try {
+      await runCopilotSearch(bot.telegram);
+      await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+      ctx.replyWithHTML(`✅ Busca concluída — sugestões enviadas acima (se encontrou tweets elegíveis).`);
+    } catch (err) {
+      await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+      ctx.replyWithHTML(`❌ <b>Erro na busca:</b> ${escHtml(err.message)}`);
+    }
+  } else {
+    const isOn = (await getSetting('copilot_enabled')) !== 'false';
+    ctx.replyWithHTML(
+      `Copiloto: <b>${isOn ? '🟢 ON' : '🔴 OFF'}</b>\n\n` +
+      `<code>/copilot on</code> — Ativar\n` +
+      `<code>/copilot off</code> — Desativar\n` +
+      `<code>/copilot agora</code> — Buscar agora`
+    );
+  }
+});
+
 bot.command('status', async (ctx) => {
   const isAuto = (await getSetting('autonomous_mode')) === 'true';
+  const isCopilot = (await getSetting('copilot_enabled')) !== 'false';
   const contexts = await listContexts();
   const nextPost = getNextScheduledPost();
 
   let text =
     `<b>Status — Agente Elon</b>\n\n` +
     `Modo autônomo: <b>${isAuto ? '🟢 ON' : '🔴 OFF'}</b>\n` +
+    `Copiloto: <b>${isCopilot ? '🟢 ON' : '🔴 OFF'}</b>\n` +
     `Próximo post: <b>${nextPost}</b>\n` +
     `Horários: 8h · 10h · 13h · 17h · 20h (Brasília)\n\n`;
 
@@ -256,7 +265,6 @@ bot.command('historico', async (ctx) => {
 
     const links = [];
     if (xIds[0]) links.push(`<a href="${tweetUrl(xIds[0], X_USERNAME)}">X</a>`);
-    if (p.linkedin_post_id) links.push(`<a href="${linkedinPostUrl(p.linkedin_post_id)}">LinkedIn</a>`);
     const linkStr = links.length ? ` — ${links.join(' · ')}` : '';
 
     text += `<b>${i + 1}. [${p.format}]</b> ${date}${linkStr}\n${escHtml(snippet)}\n\n`;
@@ -345,7 +353,11 @@ bot.on('text', async (ctx) => {
   const editState = editingState.get(chatId);
   if (editState) {
     editingState.delete(chatId);
-    await handleEditReply(ctx, text, editState);
+    if (editState.step === 'awaiting_copilot_edit') {
+      await handleCopilotEditReply(ctx, text, editState);
+    } else {
+      await handleEditReply(ctx, text, editState);
+    }
     return;
   }
 
@@ -377,7 +389,7 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// ─── Callbacks dos botões inline ─────────────────────────────────────────────
+// ─── Callbacks dos botões — Posts X ──────────────────────────────────────────
 
 // Aprovar → publicar
 bot.action(/^approve:(.+)$/, async (ctx) => {
@@ -404,14 +416,10 @@ bot.action(/^approve:(.+)$/, async (ctx) => {
       parse_mode: 'HTML',
       disable_web_page_preview: false,
     }).catch(() => {});
-
-    // Gera versão LinkedIn e envia para aprovação separada (não bloqueia)
-    queueLinkedInAfterX(pending.post).catch(() => {});
   } catch (err) {
     console.error('[bot] Erro ao publicar — mensagem:', err.message);
     console.error('[bot] Erro ao publicar — stack:\n', err.stack);
 
-    // Notifica no Telegram em vez de ficar silencioso
     const errMsg =
       `❌ <b>Falha ao publicar post ID ${escHtml(postId)}</b>\n\n` +
       `<b>Erro:</b> ${escHtml(err.message)}\n\n` +
@@ -457,46 +465,63 @@ bot.action(/^discard:(.+)$/, async (ctx) => {
   await ctx.editMessageText('❌ Post descartado.').catch(() => {});
 });
 
-// Aprovar LinkedIn
-bot.action(/^approve_li:(.+)$/, async (ctx) => {
-  const liId = ctx.match[1];
-  await ctx.answerCbQuery('Publicando no LinkedIn...').catch(() => {});
+// ─── Callbacks copiloto ───────────────────────────────────────────────────────
 
-  const pending = linkedinPendingApprovals.get(liId);
+// Responder — NUNCA automático, sempre requer aprovação explícita aqui
+bot.action(/^copilot_reply:(.+)$/, async (ctx) => {
+  const copilotId = ctx.match[1];
+  await ctx.answerCbQuery('Respondendo...').catch(() => {});
+
+  const pending = copilotPendingApprovals.get(copilotId);
   if (!pending) {
-    return ctx.editMessageText('❌ Post LinkedIn não encontrado (bot pode ter reiniciado).').catch(() => {});
+    return ctx.editMessageText('❌ Sugestão não encontrada (bot pode ter reiniciado).').catch(() => {});
   }
 
   try {
-    const linkedinPostId = await publishLinkedIn(pending.text);
-    linkedinPendingApprovals.delete(liId);
-    console.log('[bot] LinkedIn publicado — ID:', linkedinPostId);
+    const replied = await replyTweet(pending.tweetId, pending.suggestedReply);
+    copilotPendingApprovals.delete(copilotId);
+    console.log(`[bot] Resposta publicada — tweet ID: ${replied.id}`);
 
-    const liUrl = linkedinPostUrl(linkedinPostId);
+    const replyUrl = `https://x.com/${X_USERNAME || 'i/web'}/status/${replied.id}`;
     await ctx.editMessageText(
-      `✅ <b>Publicado no LinkedIn!</b>\n\n<a href="${liUrl}">Ver no LinkedIn</a>`,
+      `✅ <b>Respondido no X!</b>\n\n<i>${escHtml(pending.suggestedReply)}</i>\n\n<a href="${replyUrl}">Ver resposta</a>`,
       { parse_mode: 'HTML', disable_web_page_preview: false }
     ).catch(() => {});
   } catch (err) {
-    console.error('[bot] Erro ao publicar no LinkedIn:', err.message);
-    console.error('[bot] Stack:\n', err.stack);
-
-    const errMsg =
-      `❌ <b>Falha ao publicar no LinkedIn</b>\n\n` +
-      `<b>Erro:</b> ${escHtml(err.message)}\n\n` +
-      `<i>Verifique os logs do servidor para o stack trace completo.</i>`;
-
+    console.error('[bot] Erro ao responder tweet:', err.message);
+    const errMsg = `❌ <b>Falha ao responder</b>\n<b>Erro:</b> ${escHtml(err.message)}`;
     await ctx.editMessageText(errMsg, { parse_mode: 'HTML' }).catch(() => {});
-    await bot.telegram.sendMessage(OWNER_CHAT_ID, errMsg, { parse_mode: 'HTML' }).catch(() => {});
   }
 });
 
-// Descartar LinkedIn
-bot.action(/^discard_li:(.+)$/, async (ctx) => {
-  const liId = ctx.match[1];
-  await ctx.answerCbQuery('Descartado').catch(() => {});
-  linkedinPendingApprovals.delete(liId);
-  await ctx.editMessageText('❌ Post LinkedIn descartado.').catch(() => {});
+// Editar resposta
+bot.action(/^copilot_edit:(.+)$/, async (ctx) => {
+  const copilotId = ctx.match[1];
+  const chatId = ctx.chat.id.toString();
+  await ctx.answerCbQuery().catch(() => {});
+
+  const pending = copilotPendingApprovals.get(copilotId);
+  if (!pending) {
+    return ctx.editMessageText('❌ Sugestão não encontrada.').catch(() => {});
+  }
+
+  editingState.set(chatId, { step: 'awaiting_copilot_edit', copilotId });
+  await ctx.replyWithHTML(
+    `✏️ <b>Envie o texto editado para a resposta:</b>\n\n<i>Máx 200 caracteres · sem hashtags · sem links</i>`
+  );
+});
+
+// Pular
+bot.action(/^copilot_skip:(.+)$/, async (ctx) => {
+  const copilotId = ctx.match[1];
+  await ctx.answerCbQuery('Pulado').catch(() => {});
+
+  const pending = copilotPendingApprovals.get(copilotId);
+  if (pending) {
+    await skipTweet(pending.tweetId).catch(() => {});
+    copilotPendingApprovals.delete(copilotId);
+  }
+  await ctx.editMessageText('❌ Sugestão descartada.').catch(() => {});
 });
 
 // ─── Handlers internos ────────────────────────────────────────────────────────
@@ -509,8 +534,6 @@ async function handleGeneratedPost(ctx, post, source) {
       const { xIds } = await doPublish(post, source);
       const msg = buildPublishedMessage(post, xIds);
       await ctx.replyWithHTML(msg, { disable_web_page_preview: false });
-      // Gera versão LinkedIn e envia para aprovação separada (não bloqueia)
-      queueLinkedInAfterX(post).catch(() => {});
     } catch (err) {
       ctx.replyWithHTML(`❌ <b>Erro ao publicar:</b> ${escHtml(err.message)}`);
     }
@@ -538,10 +561,37 @@ async function handleEditReply(ctx, editedText, editState) {
   );
 }
 
+async function handleCopilotEditReply(ctx, editedText, editState) {
+  const { copilotId } = editState;
+  const pending = copilotPendingApprovals.get(copilotId);
+
+  if (!pending) {
+    return ctx.replyWithHTML(`❌ Sugestão não encontrada.`);
+  }
+
+  const trimmed = editedText.trim().substring(0, 200);
+  pending.suggestedReply = trimmed;
+
+  await bot.telegram.editMessageText(
+    OWNER_CHAT_ID,
+    pending.messageId,
+    null,
+    buildSuggestionMessage(pending.tweetText, pending.tweetUrl, pending.metrics, trimmed, true),
+    {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: copilotKeyboard(copilotId),
+    }
+  ).catch(() => {});
+
+  ctx.replyWithHTML(`✅ Resposta atualizada.`);
+}
+
 // ─── Launch ───────────────────────────────────────────────────────────────────
 
 async function launch() {
+  startCopilot(bot.telegram);
   await bot.launch();
 }
 
-module.exports = { bot, launch, sendForApproval, sendLinkedInForApproval, pendingApprovals };
+module.exports = { bot, launch, sendForApproval, pendingApprovals };

@@ -1,7 +1,7 @@
 'use strict';
 
 const cron = require('node-cron');
-const { generatePost, generateLinkedInVersion, generateLinkedInPost } = require('./ai');
+const { generatePost } = require('./ai');
 const { gatherResearch } = require('./research');
 const { publish, normalizeIds, tweetUrl } = require('./publisher');
 const { getSetting, savePost } = require('./db');
@@ -17,13 +17,6 @@ const SCHEDULE = [
   { label: '13h', cron: '0 13 * * *' },
   { label: '17h', cron: '0 17 * * *' },
   { label: '20h', cron: '0 20 * * *' },
-];
-
-// Horários LinkedIn — Seg/Qua/Sex às 9h (sempre aprovação, nunca autônomo)
-const LINKEDIN_SCHEDULE = [
-  { label: 'linkedin-segunda', cron: '0 9 * * 1' },
-  { label: 'linkedin-quarta',  cron: '0 9 * * 3' },
-  { label: 'linkedin-sexta',   cron: '0 9 * * 5' },
 ];
 
 /**
@@ -42,18 +35,6 @@ function startScheduler(sendForApproval, telegram) {
     );
     console.log(`[scheduler] Agendado X: ${label} (${expression}) America/Sao_Paulo`);
   });
-
-  // LinkedIn — Seg/Qua/Sex 9h — sempre por aprovação, nunca autônomo
-  if (process.env.LINKEDIN_ACCESS_TOKEN) {
-    LINKEDIN_SCHEDULE.forEach(({ label, cron: expression }) => {
-      cron.schedule(
-        expression,
-        () => runLinkedInJob(label, telegram),
-        { timezone: 'America/Sao_Paulo' }
-      );
-      console.log(`[scheduler] Agendado LinkedIn: ${label} (${expression}) America/Sao_Paulo`);
-    });
-  }
 }
 
 async function runJob(label, sendForApproval, telegram) {
@@ -103,33 +84,6 @@ async function runAutonomous(post, label, telegram) {
       .catch((e) => console.error('[scheduler] Erro ao notificar Telegram:', e.message));
   }
 
-  // Gera versão LinkedIn e envia para aprovação separada (nunca autônomo)
-  if (process.env.LINKEDIN_ACCESS_TOKEN) {
-    try {
-      const liText = await generateLinkedInVersion(post);
-      // Lazy-require para evitar dependência circular na inicialização
-      const { sendLinkedInForApproval } = require('./bot');
-      await sendLinkedInForApproval(liText);
-      console.log(`[scheduler] Versão LinkedIn enviada para aprovação após X autônomo (${label})`);
-    } catch (err) {
-      console.error(`[scheduler] LinkedIn queue falhou após X autônomo (${label}):`, err.message);
-    }
-  }
-}
-
-async function runLinkedInJob(label, telegram) {
-  console.log(`[scheduler] LinkedIn disparo: ${label} — ${new Date().toISOString()}`);
-
-  try {
-    const liText = await generateLinkedInPost();
-    // Lazy-require para evitar dependência circular na inicialização
-    const { sendLinkedInForApproval } = require('./bot');
-    await sendLinkedInForApproval(liText);
-    console.log(`[scheduler] Post LinkedIn enviado para aprovação (${label})`);
-  } catch (err) {
-    console.error(`[scheduler] Erro no job LinkedIn ${label}:`, err);
-    await notifyError(telegram, label, err);
-  }
 }
 
 async function notifyError(telegram, label, err) {

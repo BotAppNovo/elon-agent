@@ -54,6 +54,14 @@ async function initDb() {
       active     INTEGER     NOT NULL DEFAULT 1,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS replied_tweets (
+      tweet_id     TEXT        PRIMARY KEY,
+      reply_text   TEXT,
+      reply_id     TEXT,
+      status       TEXT        NOT NULL DEFAULT 'suggested',
+      suggested_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   // Default: autonomous_mode off
@@ -63,6 +71,16 @@ async function initDb() {
   if (existing.rows.length === 0) {
     await pool.query(
       "INSERT INTO settings (key, value) VALUES ('autonomous_mode', 'false')"
+    );
+  }
+
+  // Default: copilot_enabled on
+  const existingCopilot = await pool.query(
+    "SELECT value FROM settings WHERE key = 'copilot_enabled'"
+  );
+  if (existingCopilot.rows.length === 0) {
+    await pool.query(
+      "INSERT INTO settings (key, value) VALUES ('copilot_enabled', 'true')"
     );
   }
 
@@ -169,6 +187,39 @@ async function removeRssSource(id) {
   );
 }
 
+// ----- Replied Tweets (copilot) -----
+
+async function isTweetSuggested(tweetId) {
+  const res = await getPool().query(
+    'SELECT 1 FROM replied_tweets WHERE tweet_id = $1',
+    [tweetId]
+  );
+  return res.rows.length > 0;
+}
+
+async function saveSuggestedTweet(tweetId, replyText) {
+  await getPool().query(
+    `INSERT INTO replied_tweets (tweet_id, reply_text, status)
+     VALUES ($1, $2, 'suggested')
+     ON CONFLICT (tweet_id) DO NOTHING`,
+    [tweetId, replyText]
+  );
+}
+
+async function markTweetReplied(tweetId, replyId) {
+  await getPool().query(
+    `UPDATE replied_tweets SET reply_id = $1, status = 'replied' WHERE tweet_id = $2`,
+    [replyId, tweetId]
+  );
+}
+
+async function markTweetSkipped(tweetId) {
+  await getPool().query(
+    `UPDATE replied_tweets SET status = 'skipped' WHERE tweet_id = $1`,
+    [tweetId]
+  );
+}
+
 module.exports = {
   initDb,
   saveSetting,
@@ -183,4 +234,8 @@ module.exports = {
   getRssSources,
   saveRssSource,
   removeRssSource,
+  isTweetSuggested,
+  saveSuggestedTweet,
+  markTweetReplied,
+  markTweetSkipped,
 };

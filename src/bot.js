@@ -488,8 +488,13 @@ bot.action(/^copilot_reply:(.+)$/, async (ctx) => {
       { parse_mode: 'HTML', disable_web_page_preview: false }
     ).catch(() => {});
   } catch (err) {
-    console.error('[bot] Erro ao responder tweet:', err.message);
-    const errMsg = `❌ <b>Falha ao responder</b>\n<b>Erro:</b> ${escHtml(err.message)}`;
+    console.error('[bot] Erro ao responder tweet:', err.code, err.message);
+    if (err.data) console.error('[bot] Erro data:', JSON.stringify(err.data, null, 2));
+    const detail = err.data?.detail || err.data?.errors?.[0]?.message || err.message;
+    const errMsg =
+      `❌ <b>Falha ao responder</b>\n` +
+      (err.code ? `<b>Código:</b> ${escHtml(String(err.code))}\n` : '') +
+      `<b>Erro:</b> ${escHtml(detail)}`;
     await ctx.editMessageText(errMsg, { parse_mode: 'HTML' }).catch(() => {});
   }
 });

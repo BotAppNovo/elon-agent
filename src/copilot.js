@@ -50,6 +50,29 @@ const KEYWORD_GROUPS = [
 ];
 let keywordGroupIndex = 0;
 
+// ─── Filtro de relevância via IA ──────────────────────────────────────────────
+
+async function isRelevant(tweetText) {
+  const response = await getOpenAI().chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      {
+        role: 'user',
+        content:
+          `Avalie se este tweet tem relação REAL com os temas: produtividade pessoal, ` +
+          `esquecimento de tarefas, sobrecarga mental, rotina corrida, organização pessoal, ` +
+          `ansiedade por pendências. Tweets sobre política, economia, notícias, esportes ou ` +
+          `qualquer tema que apenas mencione essas palavras em outro contexto devem ser REJEITADOS. ` +
+          `Responda apenas APROVADO ou REJEITADO.\n\nTweet: "${tweetText}"`,
+      },
+    ],
+    max_tokens: 10,
+    temperature: 0,
+  });
+  const verdict = (response.choices[0].message.content || '').trim().toUpperCase();
+  return verdict.includes('APROVADO');
+}
+
 // ─── Geração da resposta ─────────────────────────────────────────────────────
 
 const REPLY_SYSTEM_PROMPT = `Você gera respostas curtas para tweets em português sobre produtividade, esquecimento, carga mental e rotina.
@@ -162,7 +185,30 @@ async function runCopilotSearch(telegram) {
     `[copilot] ${tweets.length} encontrados → ${filtered.length} elegíveis → ${selected.length} selecionados`
   );
 
+  // Filtro de relevância via IA
+  const relevant = [];
   for (const tweet of selected) {
+    try {
+      const ok = await isRelevant(tweet.text);
+      console.log(`[copilot] Tweet ${tweet.id} — ${ok ? 'APROVADO' : 'REJEITADO'} pela IA`);
+      if (ok) relevant.push(tweet);
+    } catch (err) {
+      console.error(`[copilot] Erro ao avaliar relevância do tweet ${tweet.id}:`, err.message);
+      relevant.push(tweet); // em caso de falha da IA, não bloquear
+    }
+  }
+
+  if (relevant.length === 0) {
+    console.log('[copilot] Nenhum tweet relevante após filtro de IA.');
+    if (telegram && OWNER_CHAT_ID) {
+      await telegram
+        .sendMessage(OWNER_CHAT_ID, '🔍 Nenhum tweet relevante encontrado nesta busca.')
+        .catch(() => {});
+    }
+    return;
+  }
+
+  for (const tweet of relevant) {
     try {
       const author = usersMap[tweet.author_id];
       const tweetUrl = `https://x.com/${author?.username || 'i/web'}/status/${tweet.id}`;
@@ -201,11 +247,11 @@ async function runCopilotSearch(telegram) {
 // ─── Publicar resposta ────────────────────────────────────────────────────────
 
 async function replyTweet(tweetId, replyText) {
-  const result = await rwClient.v2.tweet({
-    text: replyText,
-    reply: { in_reply_to_tweet_id: tweetId },
+  const id = String(tweetId); // IDs do X perdem precisão como número
+  const result = await rwClient.v2.tweet(replyText, {
+    reply: { in_reply_to_tweet_id: id },
   });
-  await markTweetReplied(tweetId, result.data.id);
+  await markTweetReplied(id, result.data.id);
   return result.data;
 }
 

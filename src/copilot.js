@@ -33,7 +33,7 @@ function getOpenAI() {
 
 // ─── Estado em memória ────────────────────────────────────────────────────────
 
-// copilotId -> { tweetId, tweetText, tweetUrl, metrics, suggestedReply, messageId }
+// copilotId -> { tweetId, tweetText, tweetUrl, metrics, suggestedReply, quoteText, messageId }
 const copilotPendingApprovals = new Map();
 
 const OWNER_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -117,6 +117,37 @@ REGRAS ABSOLUTAS:
 
 Retorne APENAS o texto da resposta, sem aspas, sem prefixo.`;
 
+const QUOTE_SYSTEM_PROMPT = `Você gera textos curtos para quote tweet em português sobre produtividade, esquecimento, carga mental e rotina.
+
+REGRAS ABSOLUTAS:
+1. Você comenta ou acrescenta perspectiva sobre o assunto do tweet — NÃO responde ao autor, NÃO é um diálogo
+2. Português brasileiro natural e informal
+3. NUNCA técnico, corporativo ou comercial
+4. Estilos: (a) opinião ou dado que amplifica o tema, (b) pergunta retórica sobre o assunto geral
+5. Máximo 200 caracteres — conte antes de responder
+6. Zero hashtags, zero links
+7. No máximo 1 emoji — e só se fizer sentido real
+8. NUNCA mencionar o Myndit, nunca fazer propaganda, nunca citar produto algum
+9. O texto deve fazer sentido isolado, sem referência ao autor original
+
+Retorne APENAS o texto, sem aspas, sem prefixo.`;
+
+async function generateQuote(tweetText) {
+  const response = await getOpenAI().chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: QUOTE_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: `Tweet a ser citado:\n"${tweetText}"\n\nGere um comentário de no máximo 200 caracteres.`,
+      },
+    ],
+    max_tokens: 100,
+    temperature: 0.85,
+  });
+  return (response.choices[0].message.content || '').trim().substring(0, 200);
+}
+
 async function generateReply(tweetText) {
   const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
@@ -135,13 +166,22 @@ async function generateReply(tweetText) {
 
 // ─── Helpers de UI ────────────────────────────────────────────────────────────
 
-function copilotKeyboard(copilotId) {
+function buildIntentUrl(tweetId, replyText) {
+  return `https://x.com/intent/post?in_reply_to=${tweetId}&text=${encodeURIComponent(replyText)}`;
+}
+
+function copilotKeyboard(copilotId, intentUrl) {
   return {
-    inline_keyboard: [[
-      { text: '✅ Responder', callback_data: `copilot_reply:${copilotId}` },
-      { text: '✏️ Editar',    callback_data: `copilot_edit:${copilotId}` },
-      { text: '❌ Pular',     callback_data: `copilot_skip:${copilotId}` },
-    ]],
+    inline_keyboard: [
+      [
+        { text: '💬 Responder no X', url: intentUrl },
+        { text: '🔁 Citar',          callback_data: `copilot_quote:${copilotId}` },
+      ],
+      [
+        { text: '✏️ Editar', callback_data: `copilot_edit:${copilotId}` },
+        { text: '❌ Pular',  callback_data: `copilot_skip:${copilotId}` },
+      ],
+    ],
   };
 }
 
@@ -290,6 +330,8 @@ async function runCopilotSearch(telegram) {
       const author = usersMap[tweet.author_id];
       const tweetUrl = `https://x.com/${author?.username || 'i/web'}/status/${tweet.id}`;
       const suggestedReply = await generateReply(tweet.text);
+      const quoteText = await generateQuote(tweet.text);
+      const intentUrl = buildIntentUrl(tweet.id, suggestedReply);
 
       await saveSuggestedTweet(tweet.id, suggestedReply);
 
@@ -301,7 +343,7 @@ async function runCopilotSearch(telegram) {
         {
           parse_mode: 'HTML',
           disable_web_page_preview: true,
-          reply_markup: copilotKeyboard(copilotId),
+          reply_markup: copilotKeyboard(copilotId, intentUrl),
         }
       );
 
@@ -311,6 +353,7 @@ async function runCopilotSearch(telegram) {
         tweetUrl,
         metrics: tweet.public_metrics,
         suggestedReply,
+        quoteText,
         messageId: message.message_id,
       });
 
@@ -321,12 +364,12 @@ async function runCopilotSearch(telegram) {
   }
 }
 
-// ─── Publicar resposta ────────────────────────────────────────────────────────
+// ─── Publicar quote tweet ─────────────────────────────────────────────────────
 
-async function replyTweet(tweetId, replyText) {
+async function quoteTweet(tweetId, quoteText) {
   const id = String(tweetId); // IDs do X perdem precisão como número
-  const result = await rwClient.v2.tweet(replyText, {
-    reply: { in_reply_to_tweet_id: id },
+  const result = await rwClient.v2.tweet(quoteText, {
+    quote_tweet_id: id,
   });
   await markTweetReplied(id, result.data.id);
   return result.data;
@@ -358,6 +401,7 @@ module.exports = {
   copilotPendingApprovals,
   copilotKeyboard,
   buildSuggestionMessage,
-  replyTweet,
+  buildIntentUrl,
+  quoteTweet,
   skipTweet,
 };

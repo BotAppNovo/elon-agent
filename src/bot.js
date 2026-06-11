@@ -24,7 +24,8 @@ const {
   copilotPendingApprovals,
   copilotKeyboard,
   buildSuggestionMessage,
-  replyTweet,
+  buildIntentUrl,
+  quoteTweet,
   skipTweet,
 } = require('./copilot');
 
@@ -467,10 +468,10 @@ bot.action(/^discard:(.+)$/, async (ctx) => {
 
 // ─── Callbacks copiloto ───────────────────────────────────────────────────────
 
-// Responder — NUNCA automático, sempre requer aprovação explícita aqui
-bot.action(/^copilot_reply:(.+)$/, async (ctx) => {
+// Citar — publica quote tweet via API
+bot.action(/^copilot_quote:(.+)$/, async (ctx) => {
   const copilotId = ctx.match[1];
-  await ctx.answerCbQuery('Respondendo...').catch(() => {});
+  await ctx.answerCbQuery('Citando...').catch(() => {});
 
   const pending = copilotPendingApprovals.get(copilotId);
   if (!pending) {
@@ -478,21 +479,21 @@ bot.action(/^copilot_reply:(.+)$/, async (ctx) => {
   }
 
   try {
-    const replied = await replyTweet(pending.tweetId, pending.suggestedReply);
+    const quoted = await quoteTweet(pending.tweetId, pending.quoteText);
     copilotPendingApprovals.delete(copilotId);
-    console.log(`[bot] Resposta publicada — tweet ID: ${replied.id}`);
+    console.log(`[bot] Quote tweet publicado — tweet ID: ${quoted.id}`);
 
-    const replyUrl = `https://x.com/${X_USERNAME || 'i/web'}/status/${replied.id}`;
+    const quoteUrl = `https://x.com/${X_USERNAME || 'i/web'}/status/${quoted.id}`;
     await ctx.editMessageText(
-      `✅ <b>Respondido no X!</b>\n\n<i>${escHtml(pending.suggestedReply)}</i>\n\n<a href="${replyUrl}">Ver resposta</a>`,
+      `✅ <b>Quote tweet publicado!</b>\n\n<i>${escHtml(pending.quoteText)}</i>\n\n<a href="${quoteUrl}">Ver no X</a>`,
       { parse_mode: 'HTML', disable_web_page_preview: false }
     ).catch(() => {});
   } catch (err) {
-    console.error('[bot] Erro ao responder tweet:', err.code, err.message);
+    console.error('[bot] Erro ao publicar quote tweet:', err.code, err.message);
     if (err.data) console.error('[bot] Erro data:', JSON.stringify(err.data, null, 2));
     const detail = err.data?.detail || err.data?.errors?.[0]?.message || err.message;
     const errMsg =
-      `❌ <b>Falha ao responder</b>\n` +
+      `❌ <b>Falha ao publicar quote tweet</b>\n` +
       (err.code ? `<b>Código:</b> ${escHtml(String(err.code))}\n` : '') +
       `<b>Erro:</b> ${escHtml(detail)}`;
     await ctx.editMessageText(errMsg, { parse_mode: 'HTML' }).catch(() => {});
@@ -576,6 +577,7 @@ async function handleCopilotEditReply(ctx, editedText, editState) {
 
   const trimmed = editedText.trim().substring(0, 200);
   pending.suggestedReply = trimmed;
+  const newIntentUrl = buildIntentUrl(pending.tweetId, trimmed);
 
   await bot.telegram.editMessageText(
     OWNER_CHAT_ID,
@@ -585,7 +587,7 @@ async function handleCopilotEditReply(ctx, editedText, editState) {
     {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
-      reply_markup: copilotKeyboard(copilotId),
+      reply_markup: copilotKeyboard(copilotId, newIntentUrl),
     }
   ).catch(() => {});
 

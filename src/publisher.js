@@ -24,8 +24,7 @@ console.log('[publisher] Inicializando cliente X com:', {
 
 async function publishTweet(text) {
   if (text.length > 280) {
-    // dividir em thread automaticamente, nunca truncar
-    return await publishThread(text.match(/.{1,270}(?:\s|$)/g));
+    throw new Error(`[publisher] Texto excede 280 chars (${text.length}), abortando publicação`);
   }
   const result = await rwClient.v2.tweet({ text });
   return { id: result.data.id, raw: result };
@@ -41,10 +40,9 @@ async function publishThread(tweets) {
 
   const raws = [];
   for (let i = 0; i < tweets.length; i++) {
-    let text = String(tweets[i]).trim();
+    const text = String(tweets[i]).trim();
     if (text.length > 280) {
-      console.error(`[publisher] Tweet ${i + 1}/${tweets.length} da thread tem ${text.length} chars (máx 280) — truncando`);
-      text = text.substring(0, 280);
+      throw new Error(`[publisher] Tweet ${i + 1}/${tweets.length} da thread tem ${text.length} chars (máx 280), abortando publicação`);
     }
     const payload = { text };
     if (previousId) {
@@ -106,13 +104,8 @@ async function publish(post) {
     default: {
       // opinion, question — post simples
       if (!post.content) throw new Error('Post sem conteudo');
-      // Guard: se o texto ultrapassar 280 chars, divide em thread em vez de truncar
       if (post.content.length > 280) {
-        const parts = splitIntoThread(post.content);
-        if (parts && parts.length > 1) {
-          console.warn(`[publisher] Tweet simples com ${post.content.length} chars → dividido em thread de ${parts.length} tweets automaticamente`);
-          return publishThread(parts);
-        }
+        throw new Error(`[publisher] Texto excede 280 chars (${post.content.length}), abortando publicação`);
       }
       return publishTweet(post.content);
     }

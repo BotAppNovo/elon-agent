@@ -49,8 +49,8 @@ REGRAS ABSOLUTAS (nunca violar):
 3. Português brasileiro natural, sem formalidade acadêmica
 4. Primeira linha PARA O SCROLL — gancho de identificação imediata, não de informação
 5. NUNCA começar com: "Hoje quero falar sobre", "Vim aqui para", "Estou animado para compartilhar"
-6. Posts simples (opinion, question): máximo 240 caracteres — a contagem da IA não é exata, a margem é necessária. Conte os caracteres antes de finalizar.
-7. Se o conteúdo não couber em 240 caracteres, use formato thread automaticamente — NUNCA corte uma frase no meio
+6. CRÍTICO: posts simples (opinion, question) têm no máximo 220 caracteres. Conte mentalmente antes de finalizar. Prefira uma ideia forte e curta a duas ideias comprimidas.
+7. Se o conteúdo não couber em 220 caracteres, use formato thread automaticamente — NUNCA corte uma frase no meio
 8. NUNCA mencionar métricas internas do app: D7, D30, número de usuários, retention, dados de beta
 9. Posts que provocam comentário e identificação, não só like
 
@@ -69,8 +69,8 @@ REGRA DO MYNDIT NOS POSTS:
 - Alarme sem contexto é um lembrete que chegou cedo demais para ser útil
 
 FORMATOS DISPONÍVEIS:
-- "opinion": Observação ou opinião curta (1 tweet, máx 240 chars) — o mais comum, deve dominar o feed
-- "question": Pergunta provocativa e direta (1 tweet, máx 240 chars) para gerar resposta nos comentários
+- "opinion": Observação ou opinião curta (1 tweet, máx 220 chars) — o mais comum, deve dominar o feed
+- "question": Pergunta provocativa e direta (1 tweet, máx 220 chars) para gerar resposta nos comentários
 - "thread": 3 a 6 tweets SEPARADOS, cada um com no máximo 240 chars, numerados (1/, 2/, 3/...)
 - "poll": Enquete com pergunta + 2 a 4 opções curtas (máx 25 chars cada opção)
 
@@ -178,7 +178,7 @@ async function generatePost(input = null, research = null) {
     // Métricas ainda não disponíveis — ignora silenciosamente
   }
 
-  userMessage += `\n\nLEMBRETE CRÍTICO: se o formato for opinion ou question, o campo "content" DEVE ter no máximo 240 caracteres. Conte agora antes de responder. Se não couber, use format=thread.`;
+  userMessage += `\n\nLEMBRETE CRÍTICO: se o formato for opinion ou question, o campo "content" DEVE ter no máximo 220 caracteres. Conte agora antes de responder. Se não couber, use format=thread.`;
   userMessage += `\n\nLEMBRETE CRÍTICO PARA THREAD: o campo "tweets" DEVE ser um array JSON com 3 a 6 strings independentes (máx 240 chars cada). NUNCA coloque os tweets como texto único ou concatenado no campo "content". Cada elemento do array é um tweet separado.`;
   userMessage += `\n\nRetorne SOMENTE o JSON sem markdown ou blocos de código.`;
 
@@ -204,7 +204,44 @@ async function generatePost(input = null, research = null) {
     throw new Error('Modelo retornou JSON invalido. Tente novamente.');
   }
 
-  return normalizePost(post);
+  const normalized = normalizePost(post);
+
+  // Validação pós-normalização: se post simples ainda exceder 240 chars, reescrever
+  if (
+    normalized.content &&
+    normalized.format !== 'thread' &&
+    normalized.format !== 'poll' &&
+    normalized.content.length > 240
+  ) {
+    console.log(`[ai] Post excedeu limite (${normalized.content.length} chars), reescrevendo...`);
+
+    let rewritten = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      rewritten = await rewriteToFitLimit(normalized.content);
+      if (rewritten && rewritten.length <= 280) {
+        console.log(`[ai] Reescrita tentativa ${attempt}: ${rewritten.length} chars — ok`);
+        normalized.content = rewritten;
+        break;
+      }
+      console.warn(`[ai] Reescrita tentativa ${attempt} ainda longa (${rewritten?.length ?? 'null'} chars)`);
+      rewritten = null;
+    }
+
+    if (!rewritten) {
+      // Após 2 tentativas falhas, converte para thread
+      console.warn('[ai] Reescrita falhou 2x — convertendo para thread');
+      const sentences = normalized.content.match(/[^.!?]+[.!?]*/g) || [normalized.content];
+      const mid = Math.ceil(sentences.length / 2);
+      normalized.format = 'thread';
+      normalized.tweets = [
+        `1/ ${sentences.slice(0, mid).join(' ').trim()}`,
+        `2/ ${sentences.slice(mid).join(' ').trim()}`,
+      ].filter((t) => t.replace(/^\d+\/ /, '').trim().length > 0);
+      normalized.content = normalized.tweets[0];
+    }
+  }
+
+  return normalized;
 }
 
 // ─────────────────────────────────────────────
@@ -240,6 +277,29 @@ async function improvePost(post, feedback) {
 // ─────────────────────────────────────────────
 
 /**
+ * Pede para a IA reescrever um post simples dentro do limite de 220 chars.
+ * Retorna o texto reescrito, ou null em caso de falha.
+ */
+async function rewriteToFitLimit(text) {
+  try {
+    const response = await getClient().chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'Você é um editor de posts para X (Twitter). Reescreva o post abaixo em no máximo 220 caracteres, preservando a ideia central e o tom. Retorne APENAS o texto reescrito, sem aspas, sem JSON, sem explicação.' },
+        { role: 'user', content: text },
+      ],
+      temperature: 0.5,
+      max_tokens: 120,
+    });
+    const rewritten = (response.choices[0].message.content || '').trim();
+    return rewritten.length > 0 ? rewritten : null;
+  } catch (err) {
+    console.error('[ai] Erro na reescrita de post longo:', err.message);
+    return null;
+  }
+}
+
+/**
  * Tenta extrair tweets individuais de um texto corrido que contém numeração (1/, 2/, 3/...).
  * Usado como fallback quando a IA retorna tweets concatenados em vez de array.
  */
@@ -271,7 +331,7 @@ function normalizePost(post) {
       post.format = 'opinion';
       post.tweets = null;
     } else {
-      post.tweets = tweets.map((t) => String(t).trim().substring(0, 240));
+      post.tweets = tweets.map((t) => String(t).trim());
       post.content = post.tweets[0];
     }
   } else {
@@ -289,11 +349,6 @@ function normalizePost(post) {
     }
   } else {
     post.poll_options = null;
-  }
-
-  // Garante 240 chars no content para posts simples (margem de segurança antes dos 280 do X)
-  if (post.content && post.format !== 'thread') {
-    post.content = post.content.substring(0, 240);
   }
 
   return post;

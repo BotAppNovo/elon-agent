@@ -187,9 +187,12 @@ bot.command('copilot', async (ctx) => {
   } else if (action === 'agora') {
     const loadingMsg = await ctx.reply('🔍 Buscando tweets...');
     try {
-      await runCopilotSearch(bot.telegram);
+      const { suggestionsSent } = await runCopilotSearch(bot.telegram);
       await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
-      ctx.replyWithHTML(`✅ Busca concluída — sugestões enviadas acima (se encontrou tweets elegíveis).`);
+      if (suggestionsSent > 0) {
+        ctx.replyWithHTML(`✅ Busca concluída — ${suggestionsSent} sugestão(ões) enviada(s) acima.`);
+      }
+      // Quando suggestionsSent === 0, runCopilotSearch já enviou a mensagem diagnóstica
     } catch (err) {
       await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
       ctx.replyWithHTML(`❌ <b>Erro na busca:</b> ${escHtml(err.message)}`);

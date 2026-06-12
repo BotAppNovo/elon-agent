@@ -276,21 +276,32 @@ function calcVelocity(tweet) {
 
 // ─── Busca individual (uma tentativa da cascata) ──────────────────────────────
 
-async function fetchAndFilter(keywords, hoursBack, minLikes, minVelocity) {
+// Retorna { selected, usersMap, totalReturned, query, error }
+// Nunca lança — captura erros e os retorna para diagnóstico.
+async function fetchAndFilter(searchNum, groupLabel, keywords, hoursBack, minLikes, minVelocity) {
   const query = `(${keywords}) lang:pt -is:retweet -is:reply`;
-  console.log(`[copilot] Buscando (${hoursBack}h, >=${minLikes} likes${minVelocity !== null ? ` OU >=${minVelocity} likes/h` : ''}): ${query}`);
+  console.log(`[copilot] Busca ${searchNum}: grupo ${groupLabel}, query: "${query}"`);
 
-  const response = await rwClient.v2.search(query, {
-    max_results: 25,
-    sort_order: 'relevancy',
-    'tweet.fields': 'public_metrics,created_at,author_id',
-    expansions: 'author_id',
-    'user.fields': 'username',
-  });
+  let response;
+  try {
+    response = await rwClient.v2.search(query, {
+      max_results: 25,
+      sort_order: 'relevancy',
+      'tweet.fields': 'public_metrics,created_at,author_id',
+      expansions: 'author_id',
+      'user.fields': 'username',
+    });
+  } catch (err) {
+    const detail = err.data ? JSON.stringify(err.data) : err.message;
+    console.error(`[copilot] Busca ${searchNum} erro de API: ${detail}`);
+    return { selected: [], usersMap: {}, totalReturned: 0, query, error: detail };
+  }
 
   const tweets = response.data?.data || [];
   const usersMap = {};
   (response.data?.includes?.users || []).forEach((u) => { usersMap[u.id] = u; });
+
+  console.log(`[copilot] Busca ${searchNum} retornou ${tweets.length} tweets`);
 
   const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
 
@@ -300,6 +311,8 @@ async function fetchAndFilter(keywords, hoursBack, minLikes, minVelocity) {
     const velocity = calcVelocity(t);
     return likes >= minLikes || (minVelocity !== null && velocity >= minVelocity);
   });
+
+  console.log(`[copilot] Após filtro de engajamento (passe ${searchNum}): ${filtered.length} tweets`);
 
   // Ordenar por velocidade de engajamento (tendência em andamento)
   filtered.sort((a, b) => calcVelocity(b) - calcVelocity(a));
@@ -311,11 +324,7 @@ async function fetchAndFilter(keywords, hoursBack, minLikes, minVelocity) {
     if (!(await isTweetSuggested(tweet.id))) selected.push(tweet);
   }
 
-  console.log(
-    `[copilot] ${tweets.length} encontrados -> ${filtered.length} elegíveis -> ${selected.length} candidatos`
-  );
-
-  return { selected, usersMap };
+  return { selected, usersMap, totalReturned: tweets.length, query, error: null };
 }
 
 // ─── Busca de tweets de um trend específico ───────────────────────────────────
@@ -363,11 +372,12 @@ async function fetchTrendTweets(trendName) {
 
 // ─── Busca principal em cascata ───────────────────────────────────────────────
 
+// Retorna { suggestionsSent } para que o chamador saiba se enviou sugestões.
 async function runCopilotSearch(telegram) {
   const enabled = (await getSetting('copilot_enabled')) !== 'false';
   if (!enabled) {
     console.log('[copilot] Desativado — busca ignorada.');
-    return;
+    return { suggestionsSent: 0 };
   }
 
   // Ler índice persistido; avança a cada tentativa para nunca repetir grupos
@@ -375,30 +385,46 @@ async function runCopilotSearch(telegram) {
   let idx = rawIdx !== null ? parseInt(rawIdx, 10) : 0;
   if (isNaN(idx) || idx < 0) idx = 0;
 
+  // Diagnóstico acumulado durante toda a execução
+  const diag = {
+    totalTweets:   0,        // total retornado pelas APIs
+    searchCount:   0,        // quantas buscas foram feitas
+    groupsUsed:    [],       // letras dos grupos usados
+    apiErrors:     [],       // erros de API
+    bestRejected:  null,     // { likes, velocity, reason, score }
+  };
+
   let approvedTweets = null; // { tweets, usersMap }
 
   for (let attempt = 0; attempt < CASCADE_ATTEMPTS.length; attempt++) {
     const { hoursBack, minLikes, minVelocity } = CASCADE_ATTEMPTS[attempt];
-    const keywords = KEYWORD_GROUPS[idx % KEYWORD_GROUPS.length];
+    const groupIdx  = idx % KEYWORD_GROUPS.length;
+    const groupLabel = String.fromCharCode(65 + groupIdx); // A–L
+    const keywords  = KEYWORD_GROUPS[groupIdx];
+
+    diag.searchCount++;
+    diag.groupsUsed.push(groupLabel);
 
     // Avança e persiste o índice ANTES de tentar (garante progresso mesmo em erro)
     idx = (idx + 1) % KEYWORD_GROUPS.length;
     await saveSetting('copilot_keyword_index', String(idx));
 
-    let selected, usersMap;
-    try {
-      ({ selected, usersMap } = await fetchAndFilter(keywords, hoursBack, minLikes, minVelocity));
-    } catch (err) {
-      console.error(`[copilot] Erro na tentativa ${attempt + 1}:`, err.message);
-      continue;
-    }
+    const { selected, usersMap, totalReturned, error } = await fetchAndFilter(
+      attempt + 1, groupLabel, keywords, hoursBack, minLikes, minVelocity
+    );
+
+    diag.totalTweets += totalReturned;
+    if (error) diag.apiErrors.push(error);
 
     if (selected.length === 0) {
+      // Rastrear o melhor candidato rejeitado pelo filtro de engajamento
+      // (já não temos acesso aos tweets brutos aqui — registrado no nível do filtro)
       console.log(`[copilot] Tentativa ${attempt + 1}: nenhum candidato após filtros de engajamento.`);
       continue;
     }
 
     // Filtro de relevância por nota — mínimo 6 em todas as tentativas
+    const scores = [];
     const relevant = [];
     for (const tweet of selected) {
       let score = 6; // fallback otimista em caso de falha da IA
@@ -408,10 +434,25 @@ async function runCopilotSearch(telegram) {
         console.error(`[copilot] Erro ao pontuar tweet ${tweet.id}:`, err.message);
       }
       const vel = calcVelocity(tweet).toFixed(1);
+      scores.push(score);
       console.log(`[copilot] Tweet ${tweet.id} — nota ${score} · ${tweet.public_metrics.like_count} likes · ${vel} likes/h`);
 
-      if (score >= 6) relevant.push(tweet);
+      if (score >= 6) {
+        relevant.push(tweet);
+      } else {
+        // Atualiza melhor rejeitado por relevância
+        const likes = tweet.public_metrics.like_count;
+        const velocity = parseFloat(calcVelocity(tweet).toFixed(1));
+        if (
+          !diag.bestRejected ||
+          likes > diag.bestRejected.likes
+        ) {
+          diag.bestRejected = { likes, velocity, reason: `nota de relevância ${score}`, score };
+        }
+      }
     }
+
+    console.log(`[copilot] Após filtro de relevância IA: ${relevant.length} tweets (notas: ${scores.join(', ')})`);
 
     if (relevant.length > 0) {
       approvedTweets = { tweets: relevant, usersMap };
@@ -421,23 +462,31 @@ async function runCopilotSearch(telegram) {
       break;
     }
 
-    console.log(`[copilot] Tentativa ${attempt + 1}: nenhum tweet passou o filtro de relevancia.`);
+    console.log(`[copilot] Tentativa ${attempt + 1}: nenhum tweet passou o filtro de relevância.`);
   }
 
   if (!approvedTweets) {
     console.log('[copilot] Cascata encerrada sem candidatos fortes.');
     if (telegram && OWNER_CHAT_ID) {
-      await telegram
-        .sendMessage(
-          OWNER_CHAT_ID,
-          '🔍 Busca concluída sem candidatos fortes. Próxima tentativa automática no horário do cron.'
-        )
-        .catch(() => {});
+      let diagMsg = `📊 ${diag.totalTweets} tweets analisados em ${diag.searchCount} busca(s).`;
+      if (diag.bestRejected) {
+        diagMsg += ` Melhor candidato rejeitado: ${diag.bestRejected.likes} likes, ${diag.bestRejected.velocity} likes/h (motivo: ${diag.bestRejected.reason}).`;
+      } else {
+        diagMsg += ` Nenhum tweet passou o filtro de engajamento.`;
+      }
+      diagMsg += ` Grupos usados: ${diag.groupsUsed.join(', ')}.`;
+      if (diag.apiErrors.length > 0) {
+        diagMsg += `\n⚠️ Erro na busca: ${diag.apiErrors[0]}`;
+      }
+      await telegram.sendMessage(OWNER_CHAT_ID, diagMsg).catch(() => {});
     }
-    return;
+    return { suggestionsSent: 0 };
   }
 
   const { tweets, usersMap } = approvedTweets;
+  let suggestionsSent = 0;
+
+  console.log(`[copilot] Enviando ${tweets.length} sugestão(ões)`);
 
   for (const tweet of tweets) {
     try {
@@ -475,6 +524,7 @@ async function runCopilotSearch(telegram) {
         messageId: message.message_id,
       });
 
+      suggestionsSent++;
       console.log(`[copilot] Sugestão enviada — tweet ${tweet.id}`);
     } catch (err) {
       console.error(`[copilot] Erro ao processar tweet ${tweet.id}:`, err.message);
@@ -548,12 +598,15 @@ async function runCopilotSearch(telegram) {
           messageId:       message.message_id,
         });
 
+        suggestionsSent++;
         console.log(`[copilot] Sugestão de trend "${trendRow.trend}" enviada — tweet ${tweet.id}`);
       } catch (err) {
         console.error(`[copilot] Erro ao processar tweet de trend ${tweet.id}:`, err.message);
       }
     }
   }
+
+  return { suggestionsSent };
 }
 
 async function skipTweet(tweetId) {

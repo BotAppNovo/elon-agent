@@ -70,16 +70,24 @@ REGRA DO MYNDIT NOS POSTS:
 FORMATOS DISPONÍVEIS:
 - "opinion": Observação ou opinião curta (1 tweet, máx 240 chars) — o mais comum, deve dominar o feed
 - "question": Pergunta provocativa e direta (1 tweet, máx 240 chars) para gerar resposta nos comentários
-- "thread": 3 a 6 tweets numerados (1/, 2/...) para desenvolver uma ideia com profundidade
+- "thread": 3 a 6 tweets SEPARADOS, cada um com no máximo 240 chars, numerados (1/, 2/, 3/...)
 - "poll": Enquete com pergunta + 2 a 4 opções curtas (máx 25 chars cada opção)
 
 FORMATO DE RETORNO — sempre JSON válido:
 {
   "format": "opinion|question|thread|poll",
-  "content": "texto do post (ou do 1° tweet se thread, ou da pergunta se poll)",
-  "tweets": ["1° tweet", "2° tweet", ...],  // apenas se format=thread
-  "poll_options": ["opção 1", "opção 2"]    // apenas se format=poll, 2-4 opções
+  "content": "texto do post (para opinion/question) OU texto do 1° tweet (para thread) OU pergunta (para poll)",
+  "tweets": ["1/ primeiro tweet", "2/ segundo tweet", "3/ terceiro tweet"],
+  "poll_options": ["opção 1", "opção 2"]
 }
+
+REGRAS CRÍTICAS PARA THREAD:
+- O campo "tweets" DEVE ser um array JSON com 3 a 6 strings — NUNCA null, NUNCA texto único
+- Cada string do array é um tweet INDEPENDENTE e COMPLETO — máx 240 chars cada
+- NUNCA coloque múltiplos tweets em uma única string do array
+- NUNCA coloque todos os tweets concatenados no campo "content"
+- Cada tweet já começa com o número: "1/ texto...", "2/ texto...", etc.
+- Exemplo correto: {"format":"thread","content":"1/ Primeiro tweet aqui","tweets":["1/ Primeiro tweet aqui","2/ Segundo tweet aqui","3/ Terceiro tweet aqui"]}
 
 Para formatos simples (opinion, question), "tweets" e "poll_options" devem ser null ou omitidos.`;
 
@@ -149,6 +157,7 @@ async function generatePost(input = null, research = null) {
   }
 
   userMessage += `\n\nLEMBRETE CRÍTICO: se o formato for opinion ou question, o campo "content" DEVE ter no máximo 240 caracteres. Conte agora antes de responder. Se não couber, use format=thread.`;
+  userMessage += `\n\nLEMBRETE CRÍTICO PARA THREAD: o campo "tweets" DEVE ser um array JSON com 3 a 6 strings independentes (máx 240 chars cada). NUNCA coloque os tweets como texto único ou concatenado no campo "content". Cada elemento do array é um tweet separado.`;
   userMessage += `\n\nRetorne SOMENTE o JSON sem markdown ou blocos de código.`;
 
   const response = await getClient().chat.completions.create({
@@ -208,6 +217,18 @@ async function improvePost(post, feedback) {
 // Helpers internos
 // ─────────────────────────────────────────────
 
+/**
+ * Tenta extrair tweets individuais de um texto corrido que contém numeração (1/, 2/, 3/...).
+ * Usado como fallback quando a IA retorna tweets concatenados em vez de array.
+ */
+function extractThreadFromContent(text) {
+  if (!text) return null;
+  // Divide nas marcações numéricas de thread (1/, 2/, 3/ ou 1. 2. 3.)
+  const parts = text.split(/\n(?=\d+[\/\.])/).map((p) => p.trim()).filter(Boolean);
+  if (parts.length >= 2) return parts;
+  return null;
+}
+
 function normalizePost(post) {
   const validFormats = ['opinion', 'question', 'thread', 'poll'];
   if (!validFormats.includes(post.format)) {
@@ -217,13 +238,18 @@ function normalizePost(post) {
   if (!post.content) post.content = '';
 
   if (post.format === 'thread') {
-    if (!Array.isArray(post.tweets) || post.tweets.length < 2) {
+    let tweets = post.tweets;
+    if (!Array.isArray(tweets) || tweets.length < 2) {
+      // Tenta extrair tweets do campo content (ex: "1/ texto\n2/ texto...")
+      tweets = extractThreadFromContent(post.content);
+    }
+    if (!tweets || tweets.length < 2) {
       // Degrada para opinião
+      console.warn('[ai] Thread sem array válido de tweets — degradando para opinion. content:', post.content?.substring(0, 100));
       post.format = 'opinion';
       post.tweets = null;
     } else {
-      // Garante que cada tweet respeita 280 chars
-      post.tweets = post.tweets.map((t) => t.substring(0, 280));
+      post.tweets = tweets.map((t) => String(t).trim().substring(0, 240));
       post.content = post.tweets[0];
     }
   } else {

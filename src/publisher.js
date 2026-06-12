@@ -41,7 +41,11 @@ async function publishThread(tweets) {
 
   const raws = [];
   for (let i = 0; i < tweets.length; i++) {
-    const text = tweets[i];
+    let text = String(tweets[i]).trim();
+    if (text.length > 280) {
+      console.error(`[publisher] Tweet ${i + 1}/${tweets.length} da thread tem ${text.length} chars (máx 280) — truncando`);
+      text = text.substring(0, 280);
+    }
     const payload = { text };
     if (previousId) {
       payload.reply = { in_reply_to_tweet_id: previousId };

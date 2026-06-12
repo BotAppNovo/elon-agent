@@ -62,6 +62,18 @@ async function initDb() {
       status       TEXT        NOT NULL DEFAULT 'suggested',
       suggested_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS post_metrics (
+      id           SERIAL PRIMARY KEY,
+      post_id      INTEGER     NOT NULL,
+      tweet_id     TEXT        NOT NULL,
+      impressions  INTEGER     NOT NULL DEFAULT 0,
+      likes        INTEGER     NOT NULL DEFAULT 0,
+      replies      INTEGER     NOT NULL DEFAULT 0,
+      retweets     INTEGER     NOT NULL DEFAULT 0,
+      quotes       INTEGER     NOT NULL DEFAULT 0,
+      collected_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   // Default: autonomous_mode off
@@ -220,6 +232,74 @@ async function markTweetSkipped(tweetId) {
   );
 }
 
+// ----- Post Metrics -----
+
+async function saveMetrics({ post_id, tweet_id, impressions, likes, replies, retweets, quotes }) {
+  await getPool().query(
+    `INSERT INTO post_metrics (post_id, tweet_id, impressions, likes, replies, retweets, quotes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [post_id, tweet_id, impressions || 0, likes || 0, replies || 0, retweets || 0, quotes || 0]
+  );
+}
+
+// daysFrom: how many days back to start; daysTo: how many days back to end (0 = now)
+async function getMetricsSummary(daysFrom = 7, daysTo = 0) {
+  const res = await getPool().query(
+    `SELECT
+       COALESCE(SUM(pm.impressions), 0)::int AS total_impressions,
+       COALESCE(SUM(pm.likes),       0)::int AS total_likes,
+       COUNT(DISTINCT p.id)::int             AS total_posts
+     FROM posts p
+     JOIN (
+       SELECT DISTINCT ON (post_id) post_id, impressions, likes
+       FROM post_metrics
+       ORDER BY post_id, collected_at DESC
+     ) pm ON pm.post_id = p.id
+     WHERE p.published_at >= NOW() - INTERVAL '1 day' * $1
+       AND p.published_at <  NOW() - INTERVAL '1 day' * $2`,
+    [daysFrom, daysTo]
+  );
+  return res.rows[0];
+}
+
+// Top performers by weighted engagement score
+async function getTopPerformerPosts(limit = 5, days = 14) {
+  const res = await getPool().query(
+    `SELECT p.id, p.content, p.format, p.published_at,
+            pm.impressions, pm.likes, pm.replies, pm.retweets, pm.quotes
+     FROM posts p
+     JOIN (
+       SELECT DISTINCT ON (post_id) post_id, impressions, likes, replies, retweets, quotes
+       FROM post_metrics
+       ORDER BY post_id, collected_at DESC
+     ) pm ON pm.post_id = p.id
+     WHERE p.published_at >= NOW() - INTERVAL '1 day' * $1
+     ORDER BY (pm.impressions + pm.likes * 5 + pm.replies * 10 + pm.retweets * 8) DESC
+     LIMIT $2`,
+    [days, limit]
+  );
+  return res.rows;
+}
+
+// Worst performers by weighted engagement score
+async function getWorstPerformerPosts(limit = 3, days = 14) {
+  const res = await getPool().query(
+    `SELECT p.id, p.content, p.format, p.published_at,
+            pm.impressions, pm.likes, pm.replies, pm.retweets, pm.quotes
+     FROM posts p
+     JOIN (
+       SELECT DISTINCT ON (post_id) post_id, impressions, likes, replies, retweets, quotes
+       FROM post_metrics
+       ORDER BY post_id, collected_at DESC
+     ) pm ON pm.post_id = p.id
+     WHERE p.published_at >= NOW() - INTERVAL '1 day' * $1
+     ORDER BY (pm.impressions + pm.likes * 5 + pm.replies * 10 + pm.retweets * 8) ASC
+     LIMIT $2`,
+    [days, limit]
+  );
+  return res.rows;
+}
+
 module.exports = {
   initDb,
   saveSetting,
@@ -238,4 +318,8 @@ module.exports = {
   saveSuggestedTweet,
   markTweetReplied,
   markTweetSkipped,
+  saveMetrics,
+  getMetricsSummary,
+  getTopPerformerPosts,
+  getWorstPerformerPosts,
 };

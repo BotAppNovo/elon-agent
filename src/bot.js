@@ -28,6 +28,7 @@ const {
   buildQuoteIntentUrl,
   skipTweet,
 } = require('./copilot');
+const { startMetrics, collectMetrics, getMetricsMessage } = require('./metrics');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -141,8 +142,11 @@ bot.command('start', (ctx) => {
     `/historico — Ver últimos 5 posts publicados\n` +
     `/limpar_contextos — Remove todos os contextos salvos\n` +
     `/fontes — Ver e gerenciar fontes de RSS\n` +
-    `/copilot on|off — Liga/desliga buscas de resposta\n` +
-    `/copilot agora — Força busca imediata`
+    `/copilot on|off — Liga/desliga buscas de resposta (9h·12h·15h·18h·21h)\n` +
+    `/copilot agora — Força busca imediata\n` +
+    `/metricas — Resumo de métricas dos últimos 7 dias\n` +
+    `/metricas coleta — Coleta métricas agora\n` +
+    `/meta [valor] [tipo] — Define meta (ex: /meta 10000 impressoes)`
   );
 });
 
@@ -176,7 +180,7 @@ bot.command('copilot', async (ctx) => {
 
   if (action === 'on') {
     await saveSetting('copilot_enabled', 'true');
-    ctx.replyWithHTML(`🟢 <b>Copiloto ATIVADO</b>\nBuscas automáticas às 11h e 19h (Brasília).`);
+    ctx.replyWithHTML(`🟢 <b>Copiloto ATIVADO</b>\nBuscas automáticas às 9h · 12h · 15h · 18h · 21h (Brasília).`);
   } else if (action === 'off') {
     await saveSetting('copilot_enabled', 'false');
     ctx.replyWithHTML(`🔴 <b>Copiloto DESATIVADO</b>\nBuscas automáticas pausadas.`);
@@ -210,7 +214,7 @@ bot.command('status', async (ctx) => {
   let text =
     `<b>Status — Agente Elon</b>\n\n` +
     `Modo autônomo: <b>${isAuto ? '🟢 ON' : '🔴 OFF'}</b>\n` +
-    `Copiloto: <b>${isCopilot ? '🟢 ON' : '🔴 OFF'}</b>\n` +
+    `Copiloto: <b>${isCopilot ? '🟢 ON' : '🔴 OFF'}</b> (9h·12h·15h·18h·21h)\n` +
     `Próximo post: <b>${nextPost}</b>\n` +
     `Horários: 8h · 10h · 13h · 17h · 20h (Brasília)\n\n`;
 
@@ -326,6 +330,79 @@ bot.command('fontes', async (ctx) => {
   text += `\n<b>Remover fonte:</b>\n<code>/fontes remover [id]</code>`;
 
   ctx.replyWithHTML(text, { disable_web_page_preview: true });
+});
+
+bot.command('meta', async (ctx) => {
+  const args = ctx.message.text.replace(/^\/meta\s*/i, '').trim().split(/\s+/);
+
+  // /meta (sem args) → mostrar meta atual
+  if (args.length < 2 || !args[0]) {
+    const raw = await getSetting('metric_goal');
+    if (!raw) {
+      return ctx.replyWithHTML(
+        `Nenhuma meta definida.\n\n` +
+        `Exemplos:\n` +
+        `<code>/meta 10000 impressoes</code>\n` +
+        `<code>/meta 500 seguidores</code>`
+      );
+    }
+    try {
+      const goal = JSON.parse(raw);
+      return ctx.replyWithHTML(
+        `🎯 <b>Meta atual:</b> ${goal.value.toLocaleString('pt-BR')} ${goal.type}\n` +
+        `<i>Definida em ${new Date(goal.set_at).toLocaleDateString('pt-BR')}</i>\n\n` +
+        `Para alterar: <code>/meta [valor] [tipo]</code>`
+      );
+    } catch {
+      return ctx.replyWithHTML(`⚠️ Meta com formato inválido no banco. Redefina com <code>/meta [valor] [tipo]</code>.`);
+    }
+  }
+
+  const value = parseInt(args[0], 10);
+  const type = (args[1] || '').toLowerCase();
+
+  if (isNaN(value) || value <= 0) {
+    return ctx.replyWithHTML(`❌ Valor inválido. Use um número inteiro positivo.\nExemplo: <code>/meta 10000 impressoes</code>`);
+  }
+
+  const validTypes = ['impressoes', 'seguidores'];
+  if (!validTypes.includes(type)) {
+    return ctx.replyWithHTML(
+      `❌ Tipo inválido: <code>${escHtml(type)}</code>\n\n` +
+      `Tipos aceitos: <code>impressoes</code> · <code>seguidores</code>\n\n` +
+      `Exemplos:\n<code>/meta 10000 impressoes</code>\n<code>/meta 500 seguidores</code>`
+    );
+  }
+
+  await saveSetting('metric_goal', JSON.stringify({ type, value, set_at: new Date().toISOString() }));
+  ctx.replyWithHTML(`🎯 <b>Meta salva:</b> ${value.toLocaleString('pt-BR')} ${type}\nAparece no relatório semanal de domingo.`);
+});
+
+bot.command('metricas', async (ctx) => {
+  const args = ctx.message.text.replace(/^\/metricas\s*/i, '').trim().toLowerCase();
+
+  if (args === 'coleta') {
+    const loadingMsg = await ctx.reply('📡 Coletando métricas...');
+    try {
+      await collectMetrics();
+      await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+      ctx.replyWithHTML(`✅ Coleta concluída. Use <code>/metricas</code> para ver o resumo.`);
+    } catch (err) {
+      await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+      ctx.replyWithHTML(`❌ <b>Erro na coleta:</b> ${escHtml(err.message)}`);
+    }
+    return;
+  }
+
+  const loadingMsg = await ctx.reply('📊 Carregando métricas...');
+  try {
+    const msg = await getMetricsMessage();
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    ctx.replyWithHTML(msg);
+  } catch (err) {
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    ctx.replyWithHTML(`❌ <b>Erro:</b> ${escHtml(err.message)}`);
+  }
 });
 
 bot.command('gerar', async (ctx) => {
@@ -567,6 +644,7 @@ async function handleCopilotEditReply(ctx, editedText, editState) {
 
 async function launch() {
   startCopilot(bot.telegram);
+  startMetrics(bot.telegram);
   await bot.launch();
 }
 

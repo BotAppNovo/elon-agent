@@ -70,10 +70,11 @@ const KEYWORD_GROUPS = [
 ];
 
 // Tentativas em cascata — máx. 3 por execução
+// minVelocity: likes/hora mínimo para aceitar mesmo sem minLikes (null = sem fallback por velocidade)
 const CASCADE_ATTEMPTS = [
-  { hoursBack: 12, minLikes: 50, minRts: 10, flexible: false }, // tentativa 1
-  { hoursBack: 24, minLikes: 20, minRts: 5,  flexible: false }, // tentativa 2
-  { hoursBack: 24, minLikes: 5,  minRts: 0,  flexible: true  }, // tentativa 3 (modo flexível)
+  { hoursBack: 12, minLikes: 100, minVelocity: 30   }, // tentativa 1
+  { hoursBack: 24, minLikes: 50,  minVelocity: 15   }, // tentativa 2
+  { hoursBack: 24, minLikes: 20,  minVelocity: null }, // tentativa 3 — abaixo de 20 likes, nunca sugerir
 ];
 
 // ─── Filtro de relevância por nota (0–10) ────────────────────────────────────
@@ -101,33 +102,44 @@ async function scoreRelevance(tweetText) {
 
 // ─── Geração da resposta ─────────────────────────────────────────────────────
 
-const REPLY_SYSTEM_PROMPT = `Você gera respostas curtas para tweets em português sobre produtividade, esquecimento, carga mental e rotina.
+const REPLY_SYSTEM_PROMPT = `Você é a voz do perfil do Myndit no X. Você responde tweets virais como uma PESSOA real, nunca como uma marca.
 
-REGRAS ABSOLUTAS:
-1. Primeira pessoa — você fala como o dono do perfil, uma pessoa real
-2. Português brasileiro natural e informal — como uma mensagem de WhatsApp inteligente
-3. NUNCA técnico, corporativo ou comercial
-4. Varie entre dois estilos: (a) agrega contexto ou opinião com identificação imediata, (b) pergunta provocativa que gera resposta
-5. Máximo 200 caracteres — conte antes de responder
-6. Zero hashtags, zero links
-7. No máximo 1 emoji — e só se fizer sentido real
-8. NUNCA mencionar o Myndit, nunca fazer propaganda, nunca citar produto algum
-9. A resposta deve fazer sentido para quem lê o tweet original — não seja genérica
+REGRAS DE OURO:
+1. Escreva como brasileiro fala no X: informal, direto, com personalidade
+2. Reaja ao conteúdo específico do tweet — nunca resposta genérica que serviria em qualquer tweet
+3. Varie entre: concordar com exagero cômico, contar micro-história pessoal em 1 frase, fazer pergunta que cutuca, dar opinião contrária leve
+4. Máximo 180 caracteres. Respostas curtas performam melhor
+5. Zero hashtags, zero links, no máximo 1 emoji (de preferência nenhum)
+6. NUNCA mencione o Myndit, app, produto ou solução. Você é só uma pessoa na conversa
+
+PROIBIDO (linguagem robótica que mata o engajamento):
+- "Que interessante", "Concordo plenamente", "Isso é muito comum"
+- "Já parou para pensar", "A verdade é que", "No final do dia"
+- Qualquer frase que pareça de assistente virtual ou consultoria
+- Reformular o que o tweet já disse com outras palavras
+
+EXEMPLOS DE TOM CERTO:
+- Tweet: "esqueci de pagar o boleto DE NOVO" → "o boleto vencido é só o sintoma, o problema é a gente confiar na própria cabeça pela 47ª vez"
+- Tweet: "minha cabeça não desliga nunca" → "e o pior horário é 23h47, quando ela resolve listar tudo que você não fez desde 2019"
+- Tweet: "preciso me organizar urgente" → "todo mundo fala isso na segunda. quarta-feira a cabeça já virou aba de navegador de novo"
 
 Retorne APENAS o texto da resposta, sem aspas, sem prefixo.`;
 
-const QUOTE_SYSTEM_PROMPT = `Você gera textos curtos para quote tweet em português sobre produtividade, esquecimento, carga mental e rotina.
+const QUOTE_SYSTEM_PROMPT = `Você é a voz do perfil do Myndit no X. Você faz quote tweets como uma PESSOA real, nunca como uma marca.
 
-REGRAS ABSOLUTAS:
-1. Você comenta ou acrescenta perspectiva sobre o assunto do tweet — NÃO responde ao autor, NÃO é um diálogo
-2. Português brasileiro natural e informal
-3. NUNCA técnico, corporativo ou comercial
-4. Estilos: (a) opinião ou dado que amplifica o tema, (b) pergunta retórica sobre o assunto geral
-5. Máximo 200 caracteres — conte antes de responder
-6. Zero hashtags, zero links
-7. No máximo 1 emoji — e só se fizer sentido real
-8. NUNCA mencionar o Myndit, nunca fazer propaganda, nunca citar produto algum
-9. O texto deve fazer sentido isolado, sem referência ao autor original
+REGRAS DE OURO:
+1. Escreva como brasileiro fala no X: informal, direto, com personalidade
+2. Você comenta o tema do tweet, não responde ao autor — o texto deve fazer sentido isolado
+3. Varie entre: ampliar o ponto com exagero cômico, contar micro-história em 1 frase, virar a perspectiva, dar opinião contrária leve
+4. Máximo 180 caracteres. Mais curto geralmente performa melhor
+5. Zero hashtags, zero links, no máximo 1 emoji (de preferência nenhum)
+6. NUNCA mencione o Myndit, app, produto ou solução. Você é só uma pessoa na conversa
+
+PROIBIDO:
+- Frases genéricas que caberiam em qualquer tweet sobre o tema
+- "Que interessante", "Muito bom isso", "Exatamente isso"
+- Tom de marca, tom de consultoria, tom de coach
+- Reformular o que o tweet já disse
 
 Retorne APENAS o texto, sem aspas, sem prefixo.`;
 
@@ -202,14 +214,25 @@ function buildSuggestionMessage(tweetText, tweetUrl, metrics, suggestedReply, ed
   );
 }
 
+// ─── Velocidade de engajamento (likes/hora) ───────────────────────────────────
+
+function calcVelocity(tweet) {
+  const hoursElapsed = Math.max(
+    (Date.now() - new Date(tweet.created_at).getTime()) / (1000 * 60 * 60),
+    0.1 // evita divisão por zero para tweets segundos após publicação
+  );
+  return tweet.public_metrics.like_count / hoursElapsed;
+}
+
 // ─── Busca individual (uma tentativa da cascata) ──────────────────────────────
 
-async function fetchAndFilter(keywords, hoursBack, minLikes, minRts) {
+async function fetchAndFilter(keywords, hoursBack, minLikes, minVelocity) {
   const query = `(${keywords}) lang:pt -is:retweet -is:reply`;
-  console.log(`[copilot] Buscando (${hoursBack}h, >=/${minLikes} likes ou >=${minRts} RTs): ${query}`);
+  console.log(`[copilot] Buscando (${hoursBack}h, >=${minLikes} likes${minVelocity !== null ? ` OU >=${minVelocity} likes/h` : ''}): ${query}`);
 
   const response = await rwClient.v2.search(query, {
-    max_results: 20,
+    max_results: 25,
+    sort_order: 'relevancy',
     'tweet.fields': 'public_metrics,created_at,author_id',
     expansions: 'author_id',
     'user.fields': 'username',
@@ -220,20 +243,18 @@ async function fetchAndFilter(keywords, hoursBack, minLikes, minRts) {
   (response.data?.includes?.users || []).forEach((u) => { usersMap[u.id] = u; });
 
   const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
+
   const filtered = tweets.filter((t) => {
     if (new Date(t.created_at) < cutoff) return false;
-    const m = t.public_metrics;
-    return m.like_count >= minLikes || (m.retweet_count + (m.quote_count || 0)) >= minRts;
+    const likes    = t.public_metrics.like_count;
+    const velocity = calcVelocity(t);
+    return likes >= minLikes || (minVelocity !== null && velocity >= minVelocity);
   });
 
-  filtered.sort((a, b) => {
-    const score = (t) =>
-      t.public_metrics.like_count +
-      3 * (t.public_metrics.retweet_count + (t.public_metrics.quote_count || 0));
-    return score(b) - score(a);
-  });
+  // Ordenar por velocidade de engajamento (tendência em andamento)
+  filtered.sort((a, b) => calcVelocity(b) - calcVelocity(a));
 
-  // Top 3, excluindo já sugeridos/respondidos
+  // Até 3 melhores, excluindo já sugeridos
   const selected = [];
   for (const tweet of filtered) {
     if (selected.length >= 3) break;
@@ -241,7 +262,7 @@ async function fetchAndFilter(keywords, hoursBack, minLikes, minRts) {
   }
 
   console.log(
-    `[copilot] ${tweets.length} encontrados -> ${filtered.length} elegiveis -> ${selected.length} candidatos`
+    `[copilot] ${tweets.length} encontrados -> ${filtered.length} elegíveis -> ${selected.length} candidatos`
   );
 
   return { selected, usersMap };
@@ -264,7 +285,7 @@ async function runCopilotSearch(telegram) {
   let approvedTweets = null; // { tweets, usersMap }
 
   for (let attempt = 0; attempt < CASCADE_ATTEMPTS.length; attempt++) {
-    const { hoursBack, minLikes, minRts, flexible } = CASCADE_ATTEMPTS[attempt];
+    const { hoursBack, minLikes, minVelocity } = CASCADE_ATTEMPTS[attempt];
     const keywords = KEYWORD_GROUPS[idx % KEYWORD_GROUPS.length];
 
     // Avança e persiste o índice ANTES de tentar (garante progresso mesmo em erro)
@@ -273,18 +294,18 @@ async function runCopilotSearch(telegram) {
 
     let selected, usersMap;
     try {
-      ({ selected, usersMap } = await fetchAndFilter(keywords, hoursBack, minLikes, minRts));
+      ({ selected, usersMap } = await fetchAndFilter(keywords, hoursBack, minLikes, minVelocity));
     } catch (err) {
       console.error(`[copilot] Erro na tentativa ${attempt + 1}:`, err.message);
       continue;
     }
 
     if (selected.length === 0) {
-      console.log(`[copilot] Tentativa ${attempt + 1}: nenhum candidato apos filtros de engajamento.`);
+      console.log(`[copilot] Tentativa ${attempt + 1}: nenhum candidato após filtros de engajamento.`);
       continue;
     }
 
-    // Filtro de relevância por nota
+    // Filtro de relevância por nota — mínimo 6 em todas as tentativas
     const relevant = [];
     for (const tweet of selected) {
       let score = 6; // fallback otimista em caso de falha da IA
@@ -293,14 +314,10 @@ async function runCopilotSearch(telegram) {
       } catch (err) {
         console.error(`[copilot] Erro ao pontuar tweet ${tweet.id}:`, err.message);
       }
-      const modeLabel = flexible ? ' (modo flexivel)' : '';
-      console.log(`[copilot] Tweet ${tweet.id} — nota ${score}${modeLabel}`);
+      const vel = calcVelocity(tweet).toFixed(1);
+      console.log(`[copilot] Tweet ${tweet.id} — nota ${score} · ${tweet.public_metrics.like_count} likes · ${vel} likes/h`);
 
-      if (score >= 6) {
-        relevant.push(tweet);
-      } else if (flexible && score >= 4) {
-        relevant.push(tweet); // aceita nota 4-5 apenas na tentativa 3
-      }
+      if (score >= 6) relevant.push(tweet);
     }
 
     if (relevant.length > 0) {
@@ -379,17 +396,23 @@ async function skipTweet(tweetId) {
 // ─── Iniciar crons ────────────────────────────────────────────────────────────
 
 function startCopilot(telegram) {
-  cron.schedule(
-    '0 11 * * *',
-    () => runCopilotSearch(telegram).catch((e) => console.error('[copilot] Erro cron 11h:', e.message)),
-    { timezone: 'America/Sao_Paulo' }
-  );
-  cron.schedule(
-    '0 19 * * *',
-    () => runCopilotSearch(telegram).catch((e) => console.error('[copilot] Erro cron 19h:', e.message)),
-    { timezone: 'America/Sao_Paulo' }
-  );
-  console.log('[copilot] Agendado: 11h e 19h (America/Sao_Paulo)');
+  const slots = [
+    { h: 9,  label: '9h'  },
+    { h: 12, label: '12h' },
+    { h: 15, label: '15h' },
+    { h: 18, label: '18h' },
+    { h: 21, label: '21h' },
+  ];
+
+  slots.forEach(({ h, label }) => {
+    cron.schedule(
+      `0 ${h} * * *`,
+      () => runCopilotSearch(telegram).catch((e) => console.error(`[copilot] Erro cron ${label}:`, e.message)),
+      { timezone: 'America/Sao_Paulo' }
+    );
+  });
+
+  console.log('[copilot] Agendado: 9h · 12h · 15h · 18h · 21h (America/Sao_Paulo)');
 }
 
 module.exports = {

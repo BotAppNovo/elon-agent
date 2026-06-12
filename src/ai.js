@@ -3,6 +3,7 @@
 const OpenAI = require('openai');
 const { getActiveContexts, getRecentPosts } = require('./db');
 const { formatResearchForPrompt } = require('./research');
+const { getLearningContext } = require('./metrics');
 
 let openaiClient;
 
@@ -154,6 +155,27 @@ async function generatePost(input = null, research = null) {
     userMessage += `Gere um post original sobre a dor que o Myndit resolve: carga cognitiva, pendências orbitando a cabeça, a ansiedade de não poder esquecer, as gambiarras que as pessoas usam (WhatsApp pra si mesmo, alarmes sem contexto). `;
     userMessage += `A maioria dos posts deve falar da DOR, não do app — só mencione o Myndit se os posts recentes ainda não mencionaram. `;
     userMessage += `Escolha o formato mais impactante e garanta variedade em relação ao histórico.`;
+  }
+
+  // Loop de aprendizado — injeta os melhores e piores posts recentes como referência
+  try {
+    const { top, worst } = await getLearningContext();
+    if (top.length > 0) {
+      userMessage += `\n\nPOSTS COM MELHOR DESEMPENHO NOS ÚLTIMOS 14 DIAS (use como inspiração de tom e formato — NUNCA repita o conteúdo):\n`;
+      top.forEach((p, i) => {
+        const snippet = p.content.substring(0, 120).replace(/\n/g, ' ');
+        userMessage += `${i + 1}. [${p.format}] ${(p.impressions || 0).toLocaleString('pt-BR')} imp · ${p.likes || 0}❤️: "${snippet}"\n`;
+      });
+    }
+    if (worst.length > 0) {
+      userMessage += `\nPOSTS COM PIOR DESEMPENHO (evite esses padrões de tom e estrutura):\n`;
+      worst.forEach((p, i) => {
+        const snippet = p.content.substring(0, 80).replace(/\n/g, ' ');
+        userMessage += `${i + 1}. [${p.format}] ${(p.impressions || 0).toLocaleString('pt-BR')} imp: "${snippet}"\n`;
+      });
+    }
+  } catch {
+    // Métricas ainda não disponíveis — ignora silenciosamente
   }
 
   userMessage += `\n\nLEMBRETE CRÍTICO: se o formato for opinion ou question, o campo "content" DEVE ter no máximo 240 caracteres. Conte agora antes de responder. Se não couber, use format=thread.`;

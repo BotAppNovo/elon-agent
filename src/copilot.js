@@ -40,11 +40,12 @@ const copilotPendingApprovals = new Map();
 const OWNER_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const X_USERNAME = process.env.X_USERNAME || null;
 
-// ─── 12 grupos de palavras-chave (rotação persistida no banco) ────────────────
-// Cada grupo vira: (keywords) lang:pt -is:retweet -is:reply
-// Todas as queries ficam bem abaixo do limite de 512 chars da API do X.
+// ─── Grupos de palavras-chave (rotação persistida no banco) ──────────────────
+// NICHE_GROUPS (A–L): frases exatas entre aspas — alta precisão, menor volume.
+// BROAD_GROUPS (M–Q): palavras sem aspas — maior alcance, encontra tweets virais.
+// A cascata usa obrigatoriamente: tentativa 1 → AMPLO, tentativas 2–3 → NICHO.
 
-const KEYWORD_GROUPS = [
+const NICHE_GROUPS = [
   // A — Esquecimento
   '"esqueci" OR "quase esqueci" OR "ia esquecer" OR "esqueci de novo" OR "vivo esquecendo" OR "esqueço tudo" OR "tinha esquecido" OR "esqueci completamente"',
   // B — Memória
@@ -71,12 +72,26 @@ const KEYWORD_GROUPS = [
   '"me organizar" OR "preciso me organizar" OR "desorganizada" OR "desorganizado" OR "tentando me organizar" OR "organizar minha vida" OR "vida uma bagunça" OR "tudo bagunçado"',
 ];
 
+const BROAD_GROUPS = [
+  // M — Esquecimento amplo (palavras comuns sem aspas — mais volume)
+  'esqueci esqueço esquecimento memória lembrei OR "ia esquecer" OR "quase esqueci"',
+  // N — Sobrecarga mental ampla
+  'sobrecarregado OR sobrecarregada OR "cabeça cheia" OR "mente cheia" OR esgotado OR esgotada OR "tô exausto" OR "tô exausta"',
+  // O — Procrastinação ampla
+  'procrastinando OR adiando OR "deixei pra depois" OR "vou fazer depois" OR enrolando OR "sem motivação"',
+  // P — Rotina e correria amplas
+  'correria OR "dia corrido" OR "semana corrida" OR "agenda cheia" OR "sem tempo" OR ocupado OR ocupada OR corrido',
+  // Q — Foco e produtividade amplas
+  '"sem foco" OR "foco zero" OR improdutivo OR improdutiva OR distraído OR distraída OR "não consigo me concentrar"',
+];
+
 // Tentativas em cascata — máx. 3 por execução
-// minVelocity: likes/hora mínimo para aceitar mesmo sem minLikes (null = sem fallback por velocidade)
+// groupType: 'broad' usa BROAD_GROUPS (M–Q); 'niche' usa NICHE_GROUPS (A–L)
+// minVelocity: likes/hora mínimo para aceitar mesmo sem minLikes (null = sem fallback)
 const CASCADE_ATTEMPTS = [
-  { hoursBack: 12, minLikes: 100, minVelocity: 30   }, // tentativa 1
-  { hoursBack: 24, minLikes: 50,  minVelocity: 15   }, // tentativa 2
-  { hoursBack: 24, minLikes: 20,  minVelocity: null }, // tentativa 3 — abaixo de 20 likes, nunca sugerir
+  { groupType: 'broad', hoursBack: 12, minLikes: 100, minVelocity: 30   }, // tentativa 1 — amplo
+  { groupType: 'niche', hoursBack: 24, minLikes: 50,  minVelocity: 15   }, // tentativa 2 — nicho
+  { groupType: 'niche', hoursBack: 24, minLikes: 20,  minVelocity: null }, // tentativa 3 — nicho fallback
 ];
 
 // ─── Filtro de relevância por nota (0–10) ────────────────────────────────────
@@ -267,11 +282,12 @@ function buildSuggestionMessage(tweetText, tweetUrl, metrics, suggestedReply, ed
 // ─── Velocidade de engajamento (likes/hora) ───────────────────────────────────
 
 function calcVelocity(tweet) {
+  if (!tweet.created_at) return 0;
   const hoursElapsed = Math.max(
     (Date.now() - new Date(tweet.created_at).getTime()) / (1000 * 60 * 60),
     0.1 // evita divisão por zero para tweets segundos após publicação
   );
-  return tweet.public_metrics.like_count / hoursElapsed;
+  return (tweet.public_metrics?.like_count ?? 0) / hoursElapsed;
 }
 
 // ─── Busca individual (uma tentativa da cascata) ──────────────────────────────
@@ -280,17 +296,20 @@ function calcVelocity(tweet) {
 // Nunca lança — captura erros e os retorna para diagnóstico.
 async function fetchAndFilter(searchNum, groupLabel, keywords, hoursBack, minLikes, minVelocity) {
   const query = `(${keywords}) lang:pt -is:retweet -is:reply`;
+  const searchParams = {
+    max_results: 25,
+    sort_order: 'relevancy',
+    'tweet.fields': 'public_metrics,created_at,author_id',
+    expansions: 'author_id',
+    'user.fields': 'username',
+  };
+
   console.log(`[copilot] Busca ${searchNum}: grupo ${groupLabel}, query: "${query}"`);
+  console.log(`[copilot] Busca ${searchNum}: parâmetros: ${JSON.stringify(searchParams)}`);
 
   let response;
   try {
-    response = await rwClient.v2.search(query, {
-      max_results: 25,
-      sort_order: 'relevancy',
-      'tweet.fields': 'public_metrics,created_at,author_id',
-      expansions: 'author_id',
-      'user.fields': 'username',
-    });
+    response = await rwClient.v2.search(query, searchParams);
   } catch (err) {
     const detail = err.data ? JSON.stringify(err.data) : err.message;
     console.error(`[copilot] Busca ${searchNum} erro de API: ${detail}`);
@@ -303,11 +322,39 @@ async function fetchAndFilter(searchNum, groupLabel, keywords, hoursBack, minLik
 
   console.log(`[copilot] Busca ${searchNum} retornou ${tweets.length} tweets`);
 
+  // Log top 5 por likes ANTES do filtro — diagnostica se public_metrics estão chegando
+  const top5 = [...tweets]
+    .sort((a, b) => (b.public_metrics?.like_count ?? 0) - (a.public_metrics?.like_count ?? 0))
+    .slice(0, 5);
+  if (top5.length > 0) {
+    const lines = top5.map((t) => {
+      const likes = t.public_metrics?.like_count ?? 'N/A';
+      const rts   = (t.public_metrics?.retweet_count ?? 0) + (t.public_metrics?.quote_count ?? 0);
+      const ageMs = t.created_at ? Date.now() - new Date(t.created_at).getTime() : null;
+      const age   = ageMs !== null ? (ageMs / (1000 * 60 * 60)).toFixed(1) : 'N/A';
+      const vel   = ageMs !== null ? ((t.public_metrics?.like_count ?? 0) / Math.max(ageMs / (1000 * 60 * 60), 0.1)).toFixed(1) : 'N/A';
+      const text  = (t.text ?? '').substring(0, 50).replace(/\n/g, ' ');
+      return `  "${text}..." (likes:${likes}, RTs:${rts}, vel:${vel}/h, idade:${age}h)`;
+    });
+    console.log(`[copilot] Top candidatos pré-filtro (busca ${searchNum}):\n${lines.join('\n')}`);
+  }
+
+  // Debug de velocidade: log do cálculo do primeiro tweet com created_at
+  const sample = tweets.find((t) => t.created_at);
+  if (sample) {
+    const ageH  = ((Date.now() - new Date(sample.created_at).getTime()) / (1000 * 60 * 60)).toFixed(2);
+    const likes = sample.public_metrics?.like_count ?? 'N/A';
+    const vel   = likes !== 'N/A' ? (likes / Math.max(parseFloat(ageH), 0.1)).toFixed(2) : 'N/A';
+    console.log(`[copilot] Exemplo velocidade: tweet ${sample.id} | created_at=${sample.created_at} | likes=${likes} | idade=${ageH}h | vel=${vel}/h`);
+  } else if (tweets.length > 0) {
+    console.warn(`[copilot] Busca ${searchNum}: NENHUM tweet tem created_at — public_metrics provavelmente ausentes`);
+  }
+
   const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
 
   const filtered = tweets.filter((t) => {
-    if (new Date(t.created_at) < cutoff) return false;
-    const likes    = t.public_metrics.like_count;
+    if (!t.created_at || new Date(t.created_at) < cutoff) return false;
+    const likes    = t.public_metrics?.like_count ?? 0;
     const velocity = calcVelocity(t);
     return likes >= minLikes || (minVelocity !== null && velocity >= minVelocity);
   });
@@ -349,8 +396,8 @@ async function fetchTrendTweets(trendName) {
   const cutoff = new Date(Date.now() - 12 * 60 * 60 * 1000);
 
   const filtered = tweets.filter((t) => {
-    if (new Date(t.created_at) < cutoff) return false;
-    const likes    = t.public_metrics.like_count;
+    if (!t.created_at || new Date(t.created_at) < cutoff) return false;
+    const likes    = t.public_metrics?.like_count ?? 0;
     const velocity = calcVelocity(t);
     return likes >= 50 || velocity >= 15;
   });
@@ -380,10 +427,14 @@ async function runCopilotSearch(telegram) {
     return { suggestionsSent: 0 };
   }
 
-  // Ler índice persistido; avança a cada tentativa para nunca repetir grupos
-  const rawIdx = await getSetting('copilot_keyword_index');
-  let idx = rawIdx !== null ? parseInt(rawIdx, 10) : 0;
-  if (isNaN(idx) || idx < 0) idx = 0;
+  // Índices persistidos separados para cada pool
+  const rawNicheIdx = await getSetting('copilot_keyword_index');
+  let nicheIdx = rawNicheIdx !== null ? parseInt(rawNicheIdx, 10) : 0;
+  if (isNaN(nicheIdx) || nicheIdx < 0) nicheIdx = 0;
+
+  const rawBroadIdx = await getSetting('copilot_broad_index');
+  let broadIdx = rawBroadIdx !== null ? parseInt(rawBroadIdx, 10) : 0;
+  if (isNaN(broadIdx) || broadIdx < 0) broadIdx = 0;
 
   // Diagnóstico acumulado durante toda a execução
   const diag = {
@@ -397,17 +448,25 @@ async function runCopilotSearch(telegram) {
   let approvedTweets = null; // { tweets, usersMap }
 
   for (let attempt = 0; attempt < CASCADE_ATTEMPTS.length; attempt++) {
-    const { hoursBack, minLikes, minVelocity } = CASCADE_ATTEMPTS[attempt];
-    const groupIdx  = idx % KEYWORD_GROUPS.length;
-    const groupLabel = String.fromCharCode(65 + groupIdx); // A–L
-    const keywords  = KEYWORD_GROUPS[groupIdx];
+    const { groupType, hoursBack, minLikes, minVelocity } = CASCADE_ATTEMPTS[attempt];
+
+    let keywords, groupLabel;
+    if (groupType === 'broad') {
+      const gi   = broadIdx % BROAD_GROUPS.length;
+      groupLabel = String.fromCharCode(77 + gi); // M–Q
+      keywords   = BROAD_GROUPS[gi];
+      broadIdx   = (broadIdx + 1) % BROAD_GROUPS.length;
+      await saveSetting('copilot_broad_index', String(broadIdx));
+    } else {
+      const gi   = nicheIdx % NICHE_GROUPS.length;
+      groupLabel = String.fromCharCode(65 + gi); // A–L
+      keywords   = NICHE_GROUPS[gi];
+      nicheIdx   = (nicheIdx + 1) % NICHE_GROUPS.length;
+      await saveSetting('copilot_keyword_index', String(nicheIdx));
+    }
 
     diag.searchCount++;
     diag.groupsUsed.push(groupLabel);
-
-    // Avança e persiste o índice ANTES de tentar (garante progresso mesmo em erro)
-    idx = (idx + 1) % KEYWORD_GROUPS.length;
-    await saveSetting('copilot_keyword_index', String(idx));
 
     const { selected, usersMap, totalReturned, error } = await fetchAndFilter(
       attempt + 1, groupLabel, keywords, hoursBack, minLikes, minVelocity

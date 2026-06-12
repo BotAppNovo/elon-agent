@@ -74,6 +74,14 @@ async function initDb() {
       quotes       INTEGER     NOT NULL DEFAULT 0,
       collected_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS trends_approved (
+      id         SERIAL PRIMARY KEY,
+      trend      TEXT        NOT NULL,
+      angle      TEXT,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   // Default: autonomous_mode off
@@ -300,6 +308,27 @@ async function getWorstPerformerPosts(limit = 3, days = 14) {
   return res.rows;
 }
 
+// ----- Trends -----
+
+async function saveApprovedTrend(trend, angle) {
+  const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
+  await getPool().query(
+    `INSERT INTO trends_approved (trend, angle, expires_at) VALUES ($1, $2, $3)`,
+    [trend, angle || null, expiresAt]
+  );
+}
+
+async function getActiveTrends() {
+  const res = await getPool().query(
+    'SELECT * FROM trends_approved WHERE expires_at > NOW() ORDER BY created_at DESC'
+  );
+  return res.rows;
+}
+
+async function clearExpiredTrends() {
+  await getPool().query('DELETE FROM trends_approved WHERE expires_at <= NOW()');
+}
+
 module.exports = {
   initDb,
   saveSetting,
@@ -322,4 +351,7 @@ module.exports = {
   getMetricsSummary,
   getTopPerformerPosts,
   getWorstPerformerPosts,
+  saveApprovedTrend,
+  getActiveTrends,
+  clearExpiredTrends,
 };

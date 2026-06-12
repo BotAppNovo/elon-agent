@@ -9,7 +9,9 @@ const {
   isTweetSuggested,
   saveSuggestedTweet,
   markTweetSkipped,
+  getActiveTrends,
 } = require('./db');
+const { fetchAndStoreTrends } = require('./trends');
 const { escHtml } = require('./utils');
 
 // ─── Twitter client ───────────────────────────────────────────────────────────
@@ -107,7 +109,7 @@ const REPLY_SYSTEM_PROMPT = `Você é a voz do perfil do Myndit no X. Você resp
 REGRAS DE OURO:
 1. Escreva como brasileiro fala no X: informal, direto, com personalidade
 2. Reaja ao conteúdo específico do tweet — nunca resposta genérica que serviria em qualquer tweet
-3. Varie entre: concordar com exagero cômico, contar micro-história pessoal em 1 frase, fazer pergunta que cutuca, dar opinião contrária leve
+3. Varie entre: concordar com exagero cômico, contar micro-história pessoal em 1 frase, fazer pergunta que cutuca, dar opinião contrária leve, humor e zueira leve quando o tweet pedir esse tom — combinar a energia do tweet original
 4. Máximo 180 caracteres. Respostas curtas performam melhor
 5. Zero hashtags, zero links, no máximo 1 emoji (de preferência nenhum)
 6. NUNCA mencione o Myndit, app, produto ou solução. Você é só uma pessoa na conversa
@@ -175,6 +177,47 @@ async function generateReply(tweetText) {
   return (response.choices[0].message.content || '').trim().substring(0, 200);
 }
 
+// ─── Resposta para tweets de trend ───────────────────────────────────────────
+
+const TREND_REPLY_SYSTEM_PROMPT = `Você responde um tweet viral de um trending topic do Brasil. Sua missão: fazer humor conectando o assunto do tweet ao universo de esquecimento, memória falha, cabeça cheia ou rotina caótica — a lente do perfil.
+
+REGRAS:
+1. A piada tem que funcionar PRIMEIRO como piada — se não fizer rir ou sorrir, não serve
+2. A conexão com o tema de memória/cabeça cheia precisa ser natural, não forçada
+3. Se não houver conexão natural possível, responda exatamente: SKIP
+4. Estilo: zueira brasileira do X, primeira pessoa, direto, informal
+5. Máximo 180 caracteres
+6. Zero hashtags, zero links, zero menção a produto ou marca
+7. No máximo 1 emoji (de preferência nenhum)
+
+EXEMPLOS DE TOM CERTO:
+- Tweet sobre jogo da Copa: "marquei 3 alarmes pra não perder o jogo e quase esqueci mesmo assim. minha cabeça não colabora nem com o que eu gosto"
+- Tweet de meme comportamental: "entendo. eu também acredito em milagre toda segunda que acho que vou fazer tudo que adiando desde março"
+
+Se não der pra conectar com naturalidade: responda apenas SKIP (em maiúsculas, sem mais nada).
+
+Retorne APENAS o texto da resposta ou SKIP, sem aspas, sem prefixo.`;
+
+async function generateTrendReply(tweetText, trendName, angle) {
+  const angleHint = angle ? `\n\nÂngulo sugerido para conexão: ${angle}` : '';
+  const response = await getOpenAI().chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: TREND_REPLY_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content:
+          `Trend: ${trendName}${angleHint}\n\n` +
+          `Tweet para responder:\n"${tweetText}"\n\n` +
+          `Gere uma resposta de no máximo 180 caracteres ou responda SKIP.`,
+      },
+    ],
+    max_tokens: 120,
+    temperature: 0.85,
+  });
+  return (response.choices[0].message.content || '').trim();
+}
+
 // ─── Helpers de UI ────────────────────────────────────────────────────────────
 
 function buildIntentUrl(tweetId, replyText) {
@@ -201,10 +244,17 @@ function copilotKeyboard(copilotId, intentUrl, quoteIntentUrl) {
   };
 }
 
-function buildSuggestionMessage(tweetText, tweetUrl, metrics, suggestedReply, edited = false) {
-  const header = edited
-    ? `🎯 <b>Copiloto — Sugestão editada</b>`
-    : `🎯 <b>Copiloto — Sugestão de resposta</b>`;
+function buildSuggestionMessage(tweetText, tweetUrl, metrics, suggestedReply, edited = false, trendName = null) {
+  let header;
+  if (trendName) {
+    header = edited
+      ? `🔥 <b>Trend: ${escHtml(trendName)} — Sugestão editada</b>`
+      : `🔥 <b>Trend: ${escHtml(trendName)}</b>`;
+  } else {
+    header = edited
+      ? `🎯 <b>Copiloto — Sugestão editada</b>`
+      : `🎯 <b>Copiloto — Sugestão de resposta</b>`;
+  }
   const rts = (metrics.retweet_count || 0) + (metrics.quote_count || 0);
   return (
     `${header}\n\n` +
@@ -263,6 +313,49 @@ async function fetchAndFilter(keywords, hoursBack, minLikes, minVelocity) {
 
   console.log(
     `[copilot] ${tweets.length} encontrados -> ${filtered.length} elegíveis -> ${selected.length} candidatos`
+  );
+
+  return { selected, usersMap };
+}
+
+// ─── Busca de tweets de um trend específico ───────────────────────────────────
+
+async function fetchTrendTweets(trendName) {
+  const safeTrend = trendName.replace(/"/g, '');
+  const query = `"${safeTrend}" lang:pt -is:retweet -is:reply`;
+  console.log(`[copilot/trend] Buscando tweets do trend "${trendName}"`);
+
+  const response = await rwClient.v2.search(query, {
+    max_results: 25,
+    sort_order: 'relevancy',
+    'tweet.fields': 'public_metrics,created_at,author_id',
+    expansions: 'author_id',
+    'user.fields': 'username',
+  });
+
+  const tweets = response.data?.data || [];
+  const usersMap = {};
+  (response.data?.includes?.users || []).forEach((u) => { usersMap[u.id] = u; });
+
+  const cutoff = new Date(Date.now() - 12 * 60 * 60 * 1000);
+
+  const filtered = tweets.filter((t) => {
+    if (new Date(t.created_at) < cutoff) return false;
+    const likes    = t.public_metrics.like_count;
+    const velocity = calcVelocity(t);
+    return likes >= 50 || velocity >= 15;
+  });
+
+  filtered.sort((a, b) => calcVelocity(b) - calcVelocity(a));
+
+  const selected = [];
+  for (const tweet of filtered) {
+    if (selected.length >= 3) break;
+    if (!(await isTweetSuggested(tweet.id))) selected.push(tweet);
+  }
+
+  console.log(
+    `[copilot/trend] "${trendName}": ${tweets.length} encontrados → ${filtered.length} elegíveis → ${selected.length} candidatos`
   );
 
   return { selected, usersMap };
@@ -387,6 +480,80 @@ async function runCopilotSearch(telegram) {
       console.error(`[copilot] Erro ao processar tweet ${tweet.id}:`, err.message);
     }
   }
+
+  // ─── Busca extra por trends ativos ──────────────────────────────────────────
+
+  let activeTrends = [];
+  try {
+    activeTrends = await getActiveTrends();
+  } catch (err) {
+    console.error('[copilot] Erro ao carregar trends ativos:', err.message);
+  }
+
+  for (const trendRow of activeTrends) {
+    let trendResult;
+    try {
+      trendResult = await fetchTrendTweets(trendRow.trend);
+    } catch (err) {
+      console.error(`[copilot] Erro ao buscar tweets do trend "${trendRow.trend}":`, err.message);
+      continue;
+    }
+
+    if (trendResult.selected.length === 0) {
+      console.log(`[copilot] Trend "${trendRow.trend}": nenhum tweet elegível.`);
+      continue;
+    }
+
+    for (const tweet of trendResult.selected) {
+      try {
+        const replyText = await generateTrendReply(tweet.text, trendRow.trend, trendRow.angle);
+
+        if (!replyText || replyText.toUpperCase() === 'SKIP') {
+          console.log(`[copilot] Trend tweet ${tweet.id} — SKIP, descartado.`);
+          await saveSuggestedTweet(tweet.id, 'SKIP');
+          continue;
+        }
+
+        const author = trendResult.usersMap[tweet.author_id];
+        const authorUsername = author?.username || 'i/web';
+        const tweetUrl = `https://x.com/${authorUsername}/status/${tweet.id}`;
+        const quoteText = await generateQuote(tweet.text);
+        const intentUrl = buildIntentUrl(tweet.id, replyText);
+        const quoteIntentUrl = buildQuoteIntentUrl(tweet.id, authorUsername, quoteText);
+
+        await saveSuggestedTweet(tweet.id, replyText);
+
+        const copilotId = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
+        const message = await telegram.sendMessage(
+          OWNER_CHAT_ID,
+          buildSuggestionMessage(tweet.text, tweetUrl, tweet.public_metrics, replyText, false, trendRow.trend),
+          {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            reply_markup: copilotKeyboard(copilotId, intentUrl, quoteIntentUrl),
+          }
+        );
+
+        copilotPendingApprovals.set(copilotId, {
+          tweetId:         tweet.id,
+          tweetText:       tweet.text,
+          tweetUrl,
+          authorUsername,
+          metrics:         tweet.public_metrics,
+          suggestedReply:  replyText,
+          quoteText,
+          quoteIntentUrl,
+          trendName:       trendRow.trend,
+          messageId:       message.message_id,
+        });
+
+        console.log(`[copilot] Sugestão de trend "${trendRow.trend}" enviada — tweet ${tweet.id}`);
+      } catch (err) {
+        console.error(`[copilot] Erro ao processar tweet de trend ${tweet.id}:`, err.message);
+      }
+    }
+  }
 }
 
 async function skipTweet(tweetId) {
@@ -397,22 +564,30 @@ async function skipTweet(tweetId) {
 
 function startCopilot(telegram) {
   const slots = [
-    { h: 9,  label: '9h'  },
-    { h: 12, label: '12h' },
-    { h: 15, label: '15h' },
-    { h: 18, label: '18h' },
-    { h: 21, label: '21h' },
+    { h: 9,  label: '9h',  refreshTrends: true  },
+    { h: 12, label: '12h', refreshTrends: false },
+    { h: 15, label: '15h', refreshTrends: true  },
+    { h: 18, label: '18h', refreshTrends: false },
+    { h: 21, label: '21h', refreshTrends: false },
   ];
 
-  slots.forEach(({ h, label }) => {
+  slots.forEach(({ h, label, refreshTrends }) => {
     cron.schedule(
       `0 ${h} * * *`,
-      () => runCopilotSearch(telegram).catch((e) => console.error(`[copilot] Erro cron ${label}:`, e.message)),
+      async () => {
+        try {
+          if (refreshTrends) await fetchAndStoreTrends();
+          await runCopilotSearch(telegram);
+        } catch (e) {
+          console.error(`[copilot] Erro cron ${label}:`, e.message);
+        }
+      },
       { timezone: 'America/Sao_Paulo' }
     );
   });
 
   console.log('[copilot] Agendado: 9h · 12h · 15h · 18h · 21h (America/Sao_Paulo)');
+  console.log('[copilot] Refresh de trends: 9h · 15h');
 }
 
 module.exports = {

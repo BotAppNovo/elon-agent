@@ -629,7 +629,7 @@ async function handleCopilotEditReply(ctx, editedText, editState) {
     OWNER_CHAT_ID,
     pending.messageId,
     null,
-    buildSuggestionMessage(pending.tweetText, pending.tweetUrl, pending.metrics, trimmed, true),
+    buildSuggestionMessage(pending.tweetText, pending.tweetUrl, pending.metrics, trimmed, true, pending.trendName || null),
     {
       parse_mode: 'HTML',
       disable_web_page_preview: true,

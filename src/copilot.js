@@ -40,72 +40,45 @@ const copilotPendingApprovals = new Map();
 const OWNER_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const X_USERNAME = process.env.X_USERNAME || null;
 
-// ─── Grupos de palavras-chave (rotação persistida no banco) ──────────────────
-// NICHE_GROUPS (A–L): frases exatas entre aspas — alta precisão, menor volume.
-// BROAD_GROUPS (M–Q): palavras sem aspas — maior alcance, encontra tweets virais.
-// A cascata usa obrigatoriamente: tentativa 1 → AMPLO, tentativas 2–3 → NICHO.
+// ─── Redes de captura viral ───────────────────────────────────────────────────
+// Queries amplas + sort_order=relevancy = tweets mais quentes do momento.
+// Cada execução usa 2 redes em rotação (índice persistido no banco como copilot_net_index).
 
-const NICHE_GROUPS = [
-  // A — Esquecimento
-  '"esqueci" OR "quase esqueci" OR "ia esquecer" OR "esqueci de novo" OR "vivo esquecendo" OR "esqueço tudo" OR "tinha esquecido" OR "esqueci completamente"',
-  // B — Memória
-  '"memória de peixe" OR "memória péssima" OR "minha memória ta" OR "não lembro de nada" OR "lembrei agora" OR "só lembrei depois" OR "lembrei tarde" OR "memória horrível"',
-  // C — Sobrecarga
-  '"cabeça cheia" OR "mente cheia" OR "mil coisas" OR "não dou conta" OR "sobrecarregada" OR "sobrecarregado" OR "pensando em mil coisas" OR "muita coisa na cabeça"',
-  // D — Procrastinação
-  '"procrastinando" OR "procrastinação" OR "deixei pra depois" OR "empurrando com a barriga" OR "enrolando pra fazer" OR "preguiça de fazer" OR "depois eu faço" OR "adiando isso"',
-  // E — Tarefas
-  '"lista de tarefas" OR "to do list" OR "pendências" OR "tarefas acumuladas" OR "checklist" OR "tanta coisa pendente" OR "tarefas atrasadas" OR "lista enorme"',
-  // F — Rotina
-  '"rotina corrida" OR "dia corrido" OR "semana lotada" OR "agenda lotada" OR "correria" OR "dia cheio" OR "não paro um minuto" OR "sem tempo pra nada"',
-  // G — Mente acelerada
-  '"mente não desliga" OR "cabeça não para" OR "pensamento acelerado" OR "não consigo relaxar" OR "mente a mil" OR "cérebro não desliga" OR "cabeça a mil" OR "não desligo"',
-  // H — Compromissos perdidos
-  '"esqueci a reunião" OR "perdi o prazo" OR "esqueci o boleto" OR "esqueci a consulta" OR "perdi a consulta" OR "esqueci de pagar" OR "esqueci de responder" OR "esqueci o aniversário"',
-  // I — Gambiarras de memória
-  '"alarme no celular" OR "lembrete no celular" OR "post-it" OR "bloco de notas" OR "mandei mensagem pra mim" OR "anotar pra não esquecer" OR "vários alarmes" OR "anotei e esqueci"',
-  // J — Noite / insônia
-  '"acordei lembrando" OR "não consigo dormir pensando" OR "deitei e lembrei" OR "madrugada pensando" OR "lembrei na hora de dormir" OR "insônia pensando" OR "acordei às 3" OR "pensando antes de dormir"',
-  // K — Desabafo de produtividade
-  '"produtividade zero" OR "dia improdutivo" OR "não rendi nada" OR "não fiz nada hoje" OR "travada" OR "travado no trabalho" OR "foco zero" OR "sem foco nenhum"',
-  // L — Organização
-  '"me organizar" OR "preciso me organizar" OR "desorganizada" OR "desorganizado" OR "tentando me organizar" OR "organizar minha vida" OR "vida uma bagunça" OR "tudo bagunçado"',
+const VIRAL_NETS = [
+  // Rede 1 — expressões universais de queixa/cumplicidade
+  '"alguém mais" OR "só eu que" OR "não aguento"',
+  // Rede 2 — marcadores de informalidade viral
+  '"gente" OR "véi" OR "mano do céu"',
+  // Rede 3 — narrativa pessoal do dia
+  '"eu hoje" OR "meu dia" OR "essa semana"',
+  // Rede 4 — incredulidade e indignação
+  '"por que ninguém" OR "como assim" OR "não acredito"',
+  // Rede 5 — rotina e trabalho
+  '"vida adulta" OR "trabalhar cansa" OR "segunda-feira"',
 ];
 
-const BROAD_GROUPS = [
-  // M — Esquecimento amplo (palavras comuns sem aspas — mais volume)
-  'esqueci esqueço esquecimento memória lembrei OR "ia esquecer" OR "quase esqueci"',
-  // N — Sobrecarga mental ampla
-  'sobrecarregado OR sobrecarregada OR "cabeça cheia" OR "mente cheia" OR esgotado OR esgotada OR "tô exausto" OR "tô exausta"',
-  // O — Procrastinação ampla
-  'procrastinando OR adiando OR "deixei pra depois" OR "vou fazer depois" OR enrolando OR "sem motivação"',
-  // P — Rotina e correria amplas
-  'correria OR "dia corrido" OR "semana corrida" OR "agenda cheia" OR "sem tempo" OR ocupado OR ocupada OR corrido',
-  // Q — Foco e produtividade amplas
-  '"sem foco" OR "foco zero" OR improdutivo OR improdutiva OR distraído OR distraída OR "não consigo me concentrar"',
+// Cascata de thresholds — aplicada sobre o pool combinado das 2 redes.
+// Percorre do mais exigente ao piso; abaixo do piso, nunca sugere.
+const CASCADE_PASSES = [
+  { minLikes: 300, minVelocity: 100, label: 'Passe 1 (viral)'  },
+  { minLikes: 150, minVelocity:  40, label: 'Passe 2 (quente)' },
+  { minLikes:  80, minVelocity:  20, label: 'Passe 3 (piso)'   },
 ];
 
-// Tentativas em cascata — máx. 3 por execução
-// groupType: 'broad' usa BROAD_GROUPS (M–Q); 'niche' usa NICHE_GROUPS (A–L)
-// minVelocity: likes/hora mínimo para aceitar mesmo sem minLikes (null = sem fallback)
-const CASCADE_ATTEMPTS = [
-  { groupType: 'broad', hoursBack: 12, minLikes: 100, minVelocity: 30   }, // tentativa 1 — amplo
-  { groupType: 'niche', hoursBack: 24, minLikes: 50,  minVelocity: 15   }, // tentativa 2 — nicho
-  { groupType: 'niche', hoursBack: 24, minLikes: 20,  minVelocity: null }, // tentativa 3 — nicho fallback
-];
+// ─── Pontuação de adaptabilidade (potencial da ponte) ─────────────────────────
 
-// ─── Filtro de relevância por nota (0–10) ────────────────────────────────────
-
-async function scoreRelevance(tweetText) {
+async function scoreAdaptability(tweetText) {
   const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       {
         role: 'user',
         content:
-          `Dê uma nota de 0 a 10 para o quanto este tweet expressa uma experiência PESSOAL com: ` +
-          `esquecimento, sobrecarga mental, procrastinação, rotina corrida ou pendências acumuladas. ` +
-          `Tweets sobre política, economia, notícias ou esportes = nota 0. ` +
+          `Este tweet viral receberá uma resposta humorística que conecta o assunto dele ao universo de: ` +
+          `memória falha, cabeça cheia, esquecimento, rotina caótica. ` +
+          `Dê nota 0-10 para o potencial dessa ponte funcionar naturalmente. ` +
+          `Política, tragédia, religião, morte, polêmica sensível = 0. ` +
+          `Zueira de cotidiano, trabalho, relacionamento, esporte, comportamento = geralmente 6+. ` +
           `Responda apenas o número.\n\nTweet: "${tweetText}"`,
       },
     ],
@@ -117,30 +90,27 @@ async function scoreRelevance(tweetText) {
   return isNaN(score) ? 0 : Math.min(10, Math.max(0, score));
 }
 
-// ─── Geração da resposta ─────────────────────────────────────────────────────
+// ─── Geração da resposta (a ponte está aqui) ──────────────────────────────────
 
-const REPLY_SYSTEM_PROMPT = `Você é a voz do perfil do Myndit no X. Você responde tweets virais como uma PESSOA real, nunca como uma marca.
+const REPLY_SYSTEM_PROMPT = `Você responde um tweet viral como uma pessoa real do X brasileiro.
 
-REGRAS DE OURO:
-1. Escreva como brasileiro fala no X: informal, direto, com personalidade
-2. Reaja ao conteúdo específico do tweet — nunca resposta genérica que serviria em qualquer tweet
-3. Varie entre: concordar com exagero cômico, contar micro-história pessoal em 1 frase, fazer pergunta que cutuca, dar opinião contrária leve, humor e zueira leve quando o tweet pedir esse tom — combinar a energia do tweet original
-4. Máximo 180 caracteres. Respostas curtas performam melhor
-5. Zero hashtags, zero links, no máximo 1 emoji (de preferência nenhum)
-6. NUNCA mencione o Myndit, app, produto ou solução. Você é só uma pessoa na conversa
+REGRA CENTRAL: sua resposta precisa funcionar PRIMEIRO como comentário sobre O QUE O TWEET DIZ — e então puxar, com humor natural, para o universo de memória falha, cabeça cheia, mil pendências ou rotina caótica. Se a ponte ficar forçada, responda SKIP.
 
-PROIBIDO (linguagem robótica que mata o engajamento):
-- "Que interessante", "Concordo plenamente", "Isso é muito comum"
-- "Já parou para pensar", "A verdade é que", "No final do dia"
-- Qualquer frase que pareça de assistente virtual ou consultoria
-- Reformular o que o tweet já disse com outras palavras
+ESTILO: primeira pessoa, zueira leve brasileira, máximo 180 caracteres, zero hashtags, zero links, zero menção a produto ou app.
 
-EXEMPLOS DE TOM CERTO:
-- Tweet: "esqueci de pagar o boleto DE NOVO" → "o boleto vencido é só o sintoma, o problema é a gente confiar na própria cabeça pela 47ª vez"
-- Tweet: "minha cabeça não desliga nunca" → "e o pior horário é 23h47, quando ela resolve listar tudo que você não fez desde 2019"
-- Tweet: "preciso me organizar urgente" → "todo mundo fala isso na segunda. quarta-feira a cabeça já virou aba de navegador de novo"
+EXEMPLOS:
+- Tweet: "não aguento mais essa semana e é terça" → "terça é o dia que o cérebro percebe que as pendências da segunda continuam todas vivas"
+- Tweet: "alguém mais sente que o dia tem 3 horas?" → "o meu tem 24, só que 21 são ocupadas lembrando do que esqueci nas outras 3"
 
-Retorne APENAS o texto da resposta, sem aspas, sem prefixo.`;
+PROIBIDO:
+- Resposta genérica que serviria em qualquer tweet
+- "Que interessante", "Concordo plenamente", "Já parou para pensar"
+- Tom de marca, tom de coach, tom de consultoria
+- Reformular o que o tweet já disse
+
+Se a ponte não funcionar naturalmente: responda apenas SKIP (maiúsculas, nada mais).
+
+Retorne APENAS o texto da resposta ou SKIP, sem aspas, sem prefixo.`;
 
 const QUOTE_SYSTEM_PROMPT = `Você é a voz do perfil do Myndit no X. Você faz quote tweets como uma PESSOA real, nunca como uma marca.
 
@@ -176,6 +146,7 @@ async function generateQuote(tweetText) {
   return (response.choices[0].message.content || '').trim().substring(0, 200);
 }
 
+// Gera a resposta com lógica de SKIP — retorna o texto ou 'SKIP'
 async function generateReply(tweetText) {
   const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
@@ -183,7 +154,7 @@ async function generateReply(tweetText) {
       { role: 'system', content: REPLY_SYSTEM_PROMPT },
       {
         role: 'user',
-        content: `Tweet para responder:\n"${tweetText}"\n\nGere uma resposta de no máximo 200 caracteres.`,
+        content: `Tweet para responder:\n"${tweetText}"\n\nGere uma resposta de no máximo 180 caracteres ou responda SKIP.`,
       },
     ],
     max_tokens: 100,
@@ -285,93 +256,45 @@ function calcVelocity(tweet) {
   if (!tweet.created_at) return 0;
   const hoursElapsed = Math.max(
     (Date.now() - new Date(tweet.created_at).getTime()) / (1000 * 60 * 60),
-    0.1 // evita divisão por zero para tweets segundos após publicação
+    0.1
   );
   return (tweet.public_metrics?.like_count ?? 0) / hoursElapsed;
 }
 
-// ─── Busca individual (uma tentativa da cascata) ──────────────────────────────
+// ─── Busca de uma rede viral ──────────────────────────────────────────────────
 
-// Retorna { selected, usersMap, totalReturned, query, error }
+// Retorna { tweets, usersMap, totalReturned, netLabel, error }
 // Nunca lança — captura erros e os retorna para diagnóstico.
-async function fetchAndFilter(searchNum, groupLabel, keywords, hoursBack, minLikes, minVelocity) {
+async function fetchNet(netIndex, netLabel) {
+  const keywords = VIRAL_NETS[netIndex];
   const query = `(${keywords}) lang:pt -is:retweet -is:reply`;
   const searchParams = {
     max_results: 25,
     sort_order: 'relevancy',
-    'tweet.fields': 'public_metrics,created_at,author_id',
+    'tweet.fields': 'public_metrics,created_at,reply_settings',
     expansions: 'author_id',
     'user.fields': 'username',
   };
 
-  console.log(`[copilot] Busca ${searchNum}: grupo ${groupLabel}, query: "${query}"`);
-  console.log(`[copilot] Busca ${searchNum}: parâmetros: ${JSON.stringify(searchParams)}`);
+  console.log(`[copilot] Rede ${netLabel}: query: "${query}"`);
+  console.log(`[copilot] Rede ${netLabel}: params: ${JSON.stringify(searchParams)}`);
 
   let response;
   try {
     response = await rwClient.v2.search(query, searchParams);
   } catch (err) {
     const detail = err.data ? JSON.stringify(err.data) : err.message;
-    console.error(`[copilot] Busca ${searchNum} erro de API: ${detail}`);
-    return { selected: [], usersMap: {}, totalReturned: 0, query, error: detail };
+    console.error(`[copilot] Rede ${netLabel} erro de API: ${detail}`);
+    return { tweets: [], usersMap: {}, totalReturned: 0, netLabel, error: detail };
   }
 
   const tweets = response.data?.data || [];
   const usersMap = {};
   (response.data?.includes?.users || []).forEach((u) => { usersMap[u.id] = u; });
 
-  console.log(`[copilot] Busca ${searchNum} retornou ${tweets.length} tweets`);
+  console.log(`[copilot] Rede ${netLabel}: ${tweets.length} tweets retornados`);
 
-  // Log top 5 por likes ANTES do filtro — diagnostica se public_metrics estão chegando
-  const top5 = [...tweets]
-    .sort((a, b) => (b.public_metrics?.like_count ?? 0) - (a.public_metrics?.like_count ?? 0))
-    .slice(0, 5);
-  if (top5.length > 0) {
-    const lines = top5.map((t) => {
-      const likes = t.public_metrics?.like_count ?? 'N/A';
-      const rts   = (t.public_metrics?.retweet_count ?? 0) + (t.public_metrics?.quote_count ?? 0);
-      const ageMs = t.created_at ? Date.now() - new Date(t.created_at).getTime() : null;
-      const age   = ageMs !== null ? (ageMs / (1000 * 60 * 60)).toFixed(1) : 'N/A';
-      const vel   = ageMs !== null ? ((t.public_metrics?.like_count ?? 0) / Math.max(ageMs / (1000 * 60 * 60), 0.1)).toFixed(1) : 'N/A';
-      const text  = (t.text ?? '').substring(0, 50).replace(/\n/g, ' ');
-      return `  "${text}..." (likes:${likes}, RTs:${rts}, vel:${vel}/h, idade:${age}h)`;
-    });
-    console.log(`[copilot] Top candidatos pré-filtro (busca ${searchNum}):\n${lines.join('\n')}`);
-  }
-
-  // Debug de velocidade: log do cálculo do primeiro tweet com created_at
-  const sample = tweets.find((t) => t.created_at);
-  if (sample) {
-    const ageH  = ((Date.now() - new Date(sample.created_at).getTime()) / (1000 * 60 * 60)).toFixed(2);
-    const likes = sample.public_metrics?.like_count ?? 'N/A';
-    const vel   = likes !== 'N/A' ? (likes / Math.max(parseFloat(ageH), 0.1)).toFixed(2) : 'N/A';
-    console.log(`[copilot] Exemplo velocidade: tweet ${sample.id} | created_at=${sample.created_at} | likes=${likes} | idade=${ageH}h | vel=${vel}/h`);
-  } else if (tweets.length > 0) {
-    console.warn(`[copilot] Busca ${searchNum}: NENHUM tweet tem created_at — public_metrics provavelmente ausentes`);
-  }
-
-  const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
-
-  const filtered = tweets.filter((t) => {
-    if (!t.created_at || new Date(t.created_at) < cutoff) return false;
-    const likes    = t.public_metrics?.like_count ?? 0;
-    const velocity = calcVelocity(t);
-    return likes >= minLikes || (minVelocity !== null && velocity >= minVelocity);
-  });
-
-  console.log(`[copilot] Após filtro de engajamento (passe ${searchNum}): ${filtered.length} tweets`);
-
-  // Ordenar por velocidade de engajamento (tendência em andamento)
-  filtered.sort((a, b) => calcVelocity(b) - calcVelocity(a));
-
-  // Até 3 melhores, excluindo já sugeridos
-  const selected = [];
-  for (const tweet of filtered) {
-    if (selected.length >= 3) break;
-    if (!(await isTweetSuggested(tweet.id))) selected.push(tweet);
-  }
-
-  return { selected, usersMap, totalReturned: tweets.length, query, error: null };
+  return { tweets, usersMap, totalReturned: tweets.length, netLabel, error: null };
 }
 
 // ─── Busca de tweets de um trend específico ───────────────────────────────────
@@ -393,13 +316,13 @@ async function fetchTrendTweets(trendName) {
   const usersMap = {};
   (response.data?.includes?.users || []).forEach((u) => { usersMap[u.id] = u; });
 
-  const cutoff = new Date(Date.now() - 12 * 60 * 60 * 1000);
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
   const filtered = tweets.filter((t) => {
     if (!t.created_at || new Date(t.created_at) < cutoff) return false;
     const likes    = t.public_metrics?.like_count ?? 0;
     const velocity = calcVelocity(t);
-    return likes >= 50 || velocity >= 15;
+    return likes >= 80 || velocity >= 20;
   });
 
   filtered.sort((a, b) => calcVelocity(b) - calcVelocity(a));
@@ -417,7 +340,7 @@ async function fetchTrendTweets(trendName) {
   return { selected, usersMap };
 }
 
-// ─── Busca principal em cascata ───────────────────────────────────────────────
+// ─── Busca principal ──────────────────────────────────────────────────────────
 
 // Retorna { suggestionsSent } para que o chamador saiba se enviou sugestões.
 async function runCopilotSearch(telegram) {
@@ -427,143 +350,224 @@ async function runCopilotSearch(telegram) {
     return { suggestionsSent: 0 };
   }
 
-  // Índices persistidos separados para cada pool
-  const rawNicheIdx = await getSetting('copilot_keyword_index');
-  let nicheIdx = rawNicheIdx !== null ? parseInt(rawNicheIdx, 10) : 0;
-  if (isNaN(nicheIdx) || nicheIdx < 0) nicheIdx = 0;
+  // Ler índice da rede (0–4), selecionar 2 redes consecutivas e avançar
+  const rawNetIdx = await getSetting('copilot_net_index');
+  let netIdx = rawNetIdx !== null ? parseInt(rawNetIdx, 10) : 0;
+  if (isNaN(netIdx) || netIdx < 0) netIdx = 0;
 
-  const rawBroadIdx = await getSetting('copilot_broad_index');
-  let broadIdx = rawBroadIdx !== null ? parseInt(rawBroadIdx, 10) : 0;
-  if (isNaN(broadIdx) || broadIdx < 0) broadIdx = 0;
+  const netAIdx   = netIdx % VIRAL_NETS.length;
+  const netBIdx   = (netIdx + 1) % VIRAL_NETS.length;
+  const netALabel = String(netAIdx + 1);
+  const netBLabel = String(netBIdx + 1);
+  await saveSetting('copilot_net_index', String((netIdx + 2) % VIRAL_NETS.length));
 
-  // Diagnóstico acumulado durante toda a execução
+  // Diagnóstico acumulado
   const diag = {
-    totalTweets:   0,        // total retornado pelas APIs
-    searchCount:   0,        // quantas buscas foram feitas
-    groupsUsed:    [],       // letras dos grupos usados
-    apiErrors:     [],       // erros de API
-    bestRejected:  null,     // { likes, velocity, reason, score }
+    totalTweets:  0,
+    netsUsed:     [`Rede ${netALabel}`, `Rede ${netBLabel}`],
+    apiErrors:    [],
+    bestRejected: null, // { likes, velocity, reason }
+    passUsed:     null,
   };
 
-  let approvedTweets = null; // { tweets, usersMap }
+  // Buscar as 2 redes em paralelo
+  const [resultA, resultB] = await Promise.all([
+    fetchNet(netAIdx, netALabel),
+    fetchNet(netBIdx, netBLabel),
+  ]);
 
-  for (let attempt = 0; attempt < CASCADE_ATTEMPTS.length; attempt++) {
-    const { groupType, hoursBack, minLikes, minVelocity } = CASCADE_ATTEMPTS[attempt];
+  if (resultA.error) diag.apiErrors.push(`Rede ${netALabel}: ${resultA.error}`);
+  if (resultB.error) diag.apiErrors.push(`Rede ${netBLabel}: ${resultB.error}`);
 
-    let keywords, groupLabel;
-    if (groupType === 'broad') {
-      const gi   = broadIdx % BROAD_GROUPS.length;
-      groupLabel = String.fromCharCode(77 + gi); // M–Q
-      keywords   = BROAD_GROUPS[gi];
-      broadIdx   = (broadIdx + 1) % BROAD_GROUPS.length;
-      await saveSetting('copilot_broad_index', String(broadIdx));
-    } else {
-      const gi   = nicheIdx % NICHE_GROUPS.length;
-      groupLabel = String.fromCharCode(65 + gi); // A–L
-      keywords   = NICHE_GROUPS[gi];
-      nicheIdx   = (nicheIdx + 1) % NICHE_GROUPS.length;
-      await saveSetting('copilot_keyword_index', String(nicheIdx));
+  // Combinar e deduplicar por id
+  const seenIds    = new Set();
+  const allTweets  = [];
+  const allUsersMap = { ...resultA.usersMap, ...resultB.usersMap };
+
+  for (const tweet of [...resultA.tweets, ...resultB.tweets]) {
+    if (!seenIds.has(tweet.id)) {
+      seenIds.add(tweet.id);
+      allTweets.push(tweet);
     }
-
-    diag.searchCount++;
-    diag.groupsUsed.push(groupLabel);
-
-    const { selected, usersMap, totalReturned, error } = await fetchAndFilter(
-      attempt + 1, groupLabel, keywords, hoursBack, minLikes, minVelocity
-    );
-
-    diag.totalTweets += totalReturned;
-    if (error) diag.apiErrors.push(error);
-
-    if (selected.length === 0) {
-      // Rastrear o melhor candidato rejeitado pelo filtro de engajamento
-      // (já não temos acesso aos tweets brutos aqui — registrado no nível do filtro)
-      console.log(`[copilot] Tentativa ${attempt + 1}: nenhum candidato após filtros de engajamento.`);
-      continue;
-    }
-
-    // Filtro de relevância por nota — mínimo 6 em todas as tentativas
-    const scores = [];
-    const relevant = [];
-    for (const tweet of selected) {
-      let score = 6; // fallback otimista em caso de falha da IA
-      try {
-        score = await scoreRelevance(tweet.text);
-      } catch (err) {
-        console.error(`[copilot] Erro ao pontuar tweet ${tweet.id}:`, err.message);
-      }
-      const vel = calcVelocity(tweet).toFixed(1);
-      scores.push(score);
-      console.log(`[copilot] Tweet ${tweet.id} — nota ${score} · ${tweet.public_metrics.like_count} likes · ${vel} likes/h`);
-
-      if (score >= 6) {
-        relevant.push(tweet);
-      } else {
-        // Atualiza melhor rejeitado por relevância
-        const likes = tweet.public_metrics.like_count;
-        const velocity = parseFloat(calcVelocity(tweet).toFixed(1));
-        if (
-          !diag.bestRejected ||
-          likes > diag.bestRejected.likes
-        ) {
-          diag.bestRejected = { likes, velocity, reason: `nota de relevância ${score}`, score };
-        }
-      }
-    }
-
-    console.log(`[copilot] Após filtro de relevância IA: ${relevant.length} tweets (notas: ${scores.join(', ')})`);
-
-    if (relevant.length > 0) {
-      approvedTweets = { tweets: relevant, usersMap };
-      console.log(
-        `[copilot] Tentativa ${attempt + 1}: ${relevant.length} tweet(s) aprovado(s) — cascata encerrada.`
-      );
-      break;
-    }
-
-    console.log(`[copilot] Tentativa ${attempt + 1}: nenhum tweet passou o filtro de relevância.`);
   }
 
-  if (!approvedTweets) {
-    console.log('[copilot] Cascata encerrada sem candidatos fortes.');
-    if (telegram && OWNER_CHAT_ID) {
-      let diagMsg = `📊 ${diag.totalTweets} tweets analisados em ${diag.searchCount} busca(s).`;
-      if (diag.bestRejected) {
-        diagMsg += ` Melhor candidato rejeitado: ${diag.bestRejected.likes} likes, ${diag.bestRejected.velocity} likes/h (motivo: ${diag.bestRejected.reason}).`;
-      } else {
-        diagMsg += ` Nenhum tweet passou o filtro de engajamento.`;
+  diag.totalTweets = allTweets.length;
+  console.log(`[copilot] Pool combinado: ${allTweets.length} tweets únicos (redes ${netALabel} + ${netBLabel})`);
+
+  // Log top 5 por likes — confirma que public_metrics estão chegando
+  const top5 = [...allTweets]
+    .sort((a, b) => (b.public_metrics?.like_count ?? 0) - (a.public_metrics?.like_count ?? 0))
+    .slice(0, 5);
+  if (top5.length > 0) {
+    const lines = top5.map((t) => {
+      const likes = t.public_metrics?.like_count ?? 'N/A';
+      const rts   = (t.public_metrics?.retweet_count ?? 0) + (t.public_metrics?.quote_count ?? 0);
+      const ageMs = t.created_at ? Date.now() - new Date(t.created_at).getTime() : null;
+      const age   = ageMs !== null ? (ageMs / (1000 * 60 * 60)).toFixed(1) : 'N/A';
+      const vel   = ageMs !== null
+        ? ((t.public_metrics?.like_count ?? 0) / Math.max(ageMs / (1000 * 60 * 60), 0.1)).toFixed(1)
+        : 'N/A';
+      const text  = (t.text ?? '').substring(0, 50).replace(/\n/g, ' ');
+      return `  "${text}..." (likes:${likes}, RTs:${rts}, vel:${vel}/h, idade:${age}h)`;
+    });
+    console.log(`[copilot] Top 5 pré-filtro:\n${lines.join('\n')}`);
+  }
+
+  // Debug de velocidade no primeiro tweet com created_at
+  const sample = allTweets.find((t) => t.created_at);
+  if (sample) {
+    const ageH  = ((Date.now() - new Date(sample.created_at).getTime()) / (1000 * 60 * 60)).toFixed(2);
+    const likes = sample.public_metrics?.like_count ?? 'N/A';
+    const vel   = likes !== 'N/A' ? (likes / Math.max(parseFloat(ageH), 0.1)).toFixed(2) : 'N/A';
+    console.log(`[copilot] Ex. velocidade: tweet ${sample.id} | created_at=${sample.created_at} | likes=${likes} | idade=${ageH}h | vel=${vel}/h`);
+  } else if (allTweets.length > 0) {
+    console.warn('[copilot] NENHUM tweet tem created_at — public_metrics provavelmente ausentes');
+  }
+
+  // Janela de 24h
+  const cutoff24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const withinWindow = allTweets.filter((t) => t.created_at && new Date(t.created_at) >= cutoff24h);
+
+  // Cascata de passes — do mais exigente ao piso
+  let candidates = [];
+  for (const pass of CASCADE_PASSES) {
+    const passing = withinWindow.filter((t) => {
+      const likes    = t.public_metrics?.like_count ?? 0;
+      const velocity = calcVelocity(t);
+      const ok = likes >= pass.minLikes || velocity >= pass.minVelocity;
+
+      if (!ok) {
+        const vel = parseFloat(calcVelocity(t).toFixed(1));
+        if (!diag.bestRejected || likes > diag.bestRejected.likes) {
+          diag.bestRejected = {
+            likes,
+            velocity: vel,
+            reason: `abaixo do ${pass.label} (mín: ${pass.minLikes} likes ou ${pass.minVelocity}/h)`,
+          };
+        }
       }
-      diagMsg += ` Grupos usados: ${diag.groupsUsed.join(', ')}.`;
+      return ok;
+    });
+
+    console.log(`[copilot] ${pass.label}: ${passing.length} tweets passaram`);
+
+    if (passing.length > 0) {
+      candidates = passing;
+      diag.passUsed = pass.label;
+      break;
+    }
+  }
+
+  if (candidates.length === 0) {
+    console.log('[copilot] Nenhum tweet passou nenhum passe da cascata.');
+    if (telegram && OWNER_CHAT_ID) {
+      let diagMsg = `📊 ${diag.totalTweets} tweets analisados. Nenhum passou o piso de engajamento (80 likes ou 20/h).`;
+      if (diag.bestRejected) {
+        diagMsg += ` Melhor rejeitado: ${diag.bestRejected.likes} likes, ${diag.bestRejected.velocity} likes/h (${diag.bestRejected.reason}).`;
+      }
+      diagMsg += ` Redes usadas: ${diag.netsUsed.join(', ')}.`;
       if (diag.apiErrors.length > 0) {
-        diagMsg += `\n⚠️ Erro na busca: ${diag.apiErrors[0]}`;
+        diagMsg += `\n⚠️ Erro de API: ${diag.apiErrors[0]}`;
       }
       await telegram.sendMessage(OWNER_CHAT_ID, diagMsg).catch(() => {});
     }
     return { suggestionsSent: 0 };
   }
 
-  const { tweets, usersMap } = approvedTweets;
+  // Remover já sugeridos
+  const unseen = [];
+  for (const tweet of candidates) {
+    if (!(await isTweetSuggested(tweet.id))) unseen.push(tweet);
+  }
+
+  if (unseen.length === 0) {
+    console.log('[copilot] Todos os candidatos já foram sugeridos anteriormente.');
+    if (telegram && OWNER_CHAT_ID) {
+      await telegram.sendMessage(
+        OWNER_CHAT_ID,
+        `📊 ${diag.totalTweets} tweets analisados. Candidatos com engajamento suficiente (${diag.passUsed}) mas todos já foram sugeridos anteriormente.`
+      ).catch(() => {});
+    }
+    return { suggestionsSent: 0 };
+  }
+
+  // Filtro de adaptabilidade por IA — nota mínima 6
+  console.log(`[copilot] Pontuando ${unseen.length} candidatos por adaptabilidade...`);
+  const scored = [];
+  for (const tweet of unseen) {
+    let score = 6; // fallback otimista em caso de falha da IA
+    try {
+      score = await scoreAdaptability(tweet.text);
+    } catch (err) {
+      console.error(`[copilot] Erro ao pontuar tweet ${tweet.id}:`, err.message);
+    }
+    const vel   = calcVelocity(tweet).toFixed(1);
+    const likes = tweet.public_metrics?.like_count ?? 0;
+    console.log(`[copilot] Tweet ${tweet.id} — adaptabilidade: ${score} · ${likes} likes · ${vel} likes/h`);
+
+    if (score >= 6) {
+      scored.push({ tweet, score });
+    } else {
+      if (!diag.bestRejected || likes > (diag.bestRejected?.likes ?? 0)) {
+        diag.bestRejected = {
+          likes,
+          velocity: parseFloat(vel),
+          reason: `nota de adaptabilidade ${score} (mín. 6)`,
+        };
+      }
+    }
+  }
+
+  if (scored.length === 0) {
+    console.log('[copilot] Nenhum tweet passou o filtro de adaptabilidade.');
+    if (telegram && OWNER_CHAT_ID) {
+      let diagMsg = `📊 ${diag.totalTweets} tweets analisados. Engajamento ok (${diag.passUsed}) mas nenhum adaptável à ponte (nota < 6).`;
+      if (diag.bestRejected) {
+        diagMsg += ` Melhor rejeitado: ${diag.bestRejected.likes} likes, ${diag.bestRejected.velocity} likes/h (${diag.bestRejected.reason}).`;
+      }
+      diagMsg += ` Redes usadas: ${diag.netsUsed.join(', ')}.`;
+      await telegram.sendMessage(OWNER_CHAT_ID, diagMsg).catch(() => {});
+    }
+    return { suggestionsSent: 0 };
+  }
+
+  // Ordenar por score + velocidade combinados, pegar os 3 melhores
+  scored.sort((a, b) => {
+    const velA = calcVelocity(a.tweet);
+    const velB = calcVelocity(b.tweet);
+    return (b.score * 100 + velB) - (a.score * 100 + velA);
+  });
+  const top3 = scored.slice(0, 3);
+
+  console.log(`[copilot] ${top3.length} tweet(s) aprovado(s) para geração de resposta`);
+
   let suggestionsSent = 0;
 
-  console.log(`[copilot] Enviando ${tweets.length} sugestão(ões)`);
-
-  for (const tweet of tweets) {
+  for (const { tweet, score } of top3) {
     try {
-      const author = usersMap[tweet.author_id];
+      // Gerar resposta com lógica de SKIP — descarta e segue para o próximo se SKIP
+      const replyText = await generateReply(tweet.text);
+
+      if (!replyText || replyText.toUpperCase() === 'SKIP') {
+        console.log(`[copilot] Tweet ${tweet.id} — resposta SKIP, descartado.`);
+        await saveSuggestedTweet(tweet.id, 'SKIP');
+        continue;
+      }
+
+      const author         = allUsersMap[tweet.author_id];
       const authorUsername = author?.username || 'i/web';
-      const tweetUrl = `https://x.com/${authorUsername}/status/${tweet.id}`;
-      const suggestedReply = await generateReply(tweet.text);
-      const quoteText = await generateQuote(tweet.text);
-      const intentUrl = buildIntentUrl(tweet.id, suggestedReply);
+      const tweetUrl       = `https://x.com/${authorUsername}/status/${tweet.id}`;
+      const quoteText      = await generateQuote(tweet.text);
+      const intentUrl      = buildIntentUrl(tweet.id, replyText);
       const quoteIntentUrl = buildQuoteIntentUrl(tweet.id, authorUsername, quoteText);
 
-      await saveSuggestedTweet(tweet.id, suggestedReply);
+      await saveSuggestedTweet(tweet.id, replyText);
 
       const copilotId = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
 
       const message = await telegram.sendMessage(
         OWNER_CHAT_ID,
-        buildSuggestionMessage(tweet.text, tweetUrl, tweet.public_metrics, suggestedReply),
+        buildSuggestionMessage(tweet.text, tweetUrl, tweet.public_metrics, replyText),
         {
           parse_mode: 'HTML',
           disable_web_page_preview: true,
@@ -572,19 +576,19 @@ async function runCopilotSearch(telegram) {
       );
 
       copilotPendingApprovals.set(copilotId, {
-        tweetId: tweet.id,
-        tweetText: tweet.text,
+        tweetId:       tweet.id,
+        tweetText:     tweet.text,
         tweetUrl,
         authorUsername,
-        metrics: tweet.public_metrics,
-        suggestedReply,
+        metrics:       tweet.public_metrics,
+        suggestedReply: replyText,
         quoteText,
         quoteIntentUrl,
-        messageId: message.message_id,
+        messageId:     message.message_id,
       });
 
       suggestionsSent++;
-      console.log(`[copilot] Sugestão enviada — tweet ${tweet.id}`);
+      console.log(`[copilot] Sugestão enviada — tweet ${tweet.id} (adaptabilidade: ${score})`);
     } catch (err) {
       console.error(`[copilot] Erro ao processar tweet ${tweet.id}:`, err.message);
     }
@@ -623,11 +627,11 @@ async function runCopilotSearch(telegram) {
           continue;
         }
 
-        const author = trendResult.usersMap[tweet.author_id];
+        const author         = trendResult.usersMap[tweet.author_id];
         const authorUsername = author?.username || 'i/web';
-        const tweetUrl = `https://x.com/${authorUsername}/status/${tweet.id}`;
-        const quoteText = await generateQuote(tweet.text);
-        const intentUrl = buildIntentUrl(tweet.id, replyText);
+        const tweetUrl       = `https://x.com/${authorUsername}/status/${tweet.id}`;
+        const quoteText      = await generateQuote(tweet.text);
+        const intentUrl      = buildIntentUrl(tweet.id, replyText);
         const quoteIntentUrl = buildQuoteIntentUrl(tweet.id, authorUsername, quoteText);
 
         await saveSuggestedTweet(tweet.id, replyText);
@@ -645,16 +649,16 @@ async function runCopilotSearch(telegram) {
         );
 
         copilotPendingApprovals.set(copilotId, {
-          tweetId:         tweet.id,
-          tweetText:       tweet.text,
+          tweetId:        tweet.id,
+          tweetText:      tweet.text,
           tweetUrl,
           authorUsername,
-          metrics:         tweet.public_metrics,
-          suggestedReply:  replyText,
+          metrics:        tweet.public_metrics,
+          suggestedReply: replyText,
           quoteText,
           quoteIntentUrl,
-          trendName:       trendRow.trend,
-          messageId:       message.message_id,
+          trendName:      trendRow.trend,
+          messageId:      message.message_id,
         });
 
         suggestionsSent++;

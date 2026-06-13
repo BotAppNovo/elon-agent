@@ -56,10 +56,22 @@ function calcVelocity(tweet) {
   return (tweet.public_metrics?.like_count ?? 0) / hoursElapsed;
 }
 
-// ─── Busca do pool (3 chamadas paginadas) ─────────────────────────────────────
+// ─── Queries rotativas (palavras mais comuns do PT — garante volume alto) ────────
+
+const POOL_QUERIES = [
+  '(eu OR vc OR você OR minha OR meu) lang:pt -is:retweet -is:reply',
+  '(hoje OR agora OR essa OR esse OR aqui) lang:pt -is:retweet -is:reply',
+  '(gente OR cara OR mano OR amigo OR pessoal) lang:pt -is:retweet -is:reply',
+  '(não OR nunca OR sempre OR ainda OR já) lang:pt -is:retweet -is:reply',
+  '(que OR como OR quando OR porque OR mas) lang:pt -is:retweet -is:reply',
+];
+
+// Índice de rotação persistido em memória (avança a cada execução)
+let _queryRotationIndex = 0;
+
+// ─── Busca do pool (3 queries em paralelo, rotacionando) ─────────────────────
 
 async function fetchPool() {
-  const query      = '(vida adulta OR alguém mais OR esqueci OR não aguento OR semana OR segunda OR tarefa OR pendência) lang:pt -is:retweet -is:reply';
   const start_time = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const baseParams = {
     max_results:    25,
@@ -70,27 +82,38 @@ async function fetchPool() {
     start_time,
   };
 
+  // Seleciona 3 queries consecutivas a partir do índice atual
+  const selected = [0, 1, 2].map((offset) =>
+    POOL_QUERIES[(_queryRotationIndex + offset) % POOL_QUERIES.length]
+  );
+  _queryRotationIndex = (_queryRotationIndex + 3) % POOL_QUERIES.length;
+
+  console.log(`[copilot] Queries selecionadas: ${selected.map((q, i) => `Q${i + 1}`).join(', ')}`);
+
+  // Executa as 3 queries em paralelo
+  const results = await Promise.allSettled(
+    selected.map((query, i) =>
+      rwClient.v2.search(query, { ...baseParams }).then((response) => {
+        const tweets = response.data?.data || [];
+        const users  = response.data?.includes?.users || [];
+        console.log(`[copilot] Query ${i + 1}/3: ${tweets.length} tweets`);
+        return { tweets, users };
+      })
+    )
+  );
+
   const allTweets = [];
   const usersMap  = {};
-  let   nextToken = undefined;
 
-  for (let call = 1; call <= 3; call++) {
-    const params = { ...baseParams };
-    if (nextToken) params.next_token = nextToken;
-
-    try {
-      console.log(`[copilot] Chamada ${call}/3`);
-      const response = await rwClient.v2.search(query, params);
-      const tweets   = response.data?.data || [];
-      (response.data?.includes?.users || []).forEach((u) => { usersMap[u.id] = u; });
-      allTweets.push(...tweets);
-      nextToken = response.data?.meta?.next_token;
-      console.log(`[copilot] Chamada ${call}/3: ${tweets.length} tweets recebidos`);
-      if (!nextToken) break;
-    } catch (err) {
-      const detail = err.data ? JSON.stringify(err.data) : err.message;
-      console.error(`[copilot] Chamada ${call}/3 falhou: ${detail}`);
-      break;
+  for (const [i, result] of results.entries()) {
+    if (result.status === 'fulfilled') {
+      allTweets.push(...result.value.tweets);
+      result.value.users.forEach((u) => { usersMap[u.id] = u; });
+    } else {
+      const detail = result.reason?.data
+        ? JSON.stringify(result.reason.data)
+        : result.reason?.message;
+      console.error(`[copilot] Query ${i + 1}/3 falhou: ${detail}`);
     }
   }
 

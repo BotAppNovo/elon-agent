@@ -28,7 +28,7 @@ const {
   buildQuoteIntentUrl,
   skipTweet,
 } = require('./copilot');
-const { startMetrics, collectMetrics, getMetricsMessage } = require('./metrics');
+const { startMetrics, collectMetrics, getMetricsMessage, generateReport } = require('./metrics');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -142,11 +142,12 @@ bot.command('start', (ctx) => {
     `/historico — Ver últimos 5 posts publicados\n` +
     `/limpar_contextos — Remove todos os contextos salvos\n` +
     `/fontes — Ver e gerenciar fontes de RSS\n` +
-    `/copilot on|off — Liga/desliga buscas de resposta (9h·12h·15h·18h·21h)\n` +
+    `/copilot on|off — Liga/desliga buscas de resposta (7h)\n` +
     `/copilot agora — Força busca imediata\n` +
     `/metricas — Resumo de métricas dos últimos 7 dias\n` +
     `/metricas coleta — Coleta métricas agora\n` +
-    `/meta [valor] [tipo] — Define meta (ex: /meta 10000 impressoes)`
+    `/relatorio — Gera relatório completo com análise da IA\n` +
+    `/meta [N] — Define meta de seguidores (ex: /meta 1000)`
   );
 });
 
@@ -180,7 +181,7 @@ bot.command('copilot', async (ctx) => {
 
   if (action === 'on') {
     await saveSetting('copilot_enabled', 'true');
-    ctx.replyWithHTML(`🟢 <b>Copiloto ATIVADO</b>\nBuscas automáticas às 9h · 12h · 15h · 18h · 21h (Brasília).`);
+    ctx.replyWithHTML(`🟢 <b>Copiloto ATIVADO</b>\nBuscas automáticas às 7h (Brasília).`);
   } else if (action === 'off') {
     await saveSetting('copilot_enabled', 'false');
     ctx.replyWithHTML(`🔴 <b>Copiloto DESATIVADO</b>\nBuscas automáticas pausadas.`);
@@ -217,9 +218,9 @@ bot.command('status', async (ctx) => {
   let text =
     `<b>Status — Agente Elon</b>\n\n` +
     `Modo autônomo: <b>${isAuto ? '🟢 ON' : '🔴 OFF'}</b>\n` +
-    `Copiloto: <b>${isCopilot ? '🟢 ON' : '🔴 OFF'}</b> (9h·12h·15h·18h·21h)\n` +
+    `Copiloto: <b>${isCopilot ? '🟢 ON' : '🔴 OFF'}</b> (7h)\n` +
     `Próximo post: <b>${nextPost}</b>\n` +
-    `Horários: 8h · 10h · 13h · 17h · 20h (Brasília)\n\n`;
+    `Horários: 8h · 20h (Brasília)\n\n`;
 
   if (contexts.length > 0) {
     text += `<b>Contextos ativos (${contexts.length}):</b>\n`;
@@ -336,49 +337,25 @@ bot.command('fontes', async (ctx) => {
 });
 
 bot.command('meta', async (ctx) => {
-  const args = ctx.message.text.replace(/^\/meta\s*/i, '').trim().split(/\s+/);
+  const raw = ctx.message.text.replace(/^\/meta\s*/i, '').trim();
 
   // /meta (sem args) → mostrar meta atual
-  if (args.length < 2 || !args[0]) {
-    const raw = await getSetting('metric_goal');
-    if (!raw) {
-      return ctx.replyWithHTML(
-        `Nenhuma meta definida.\n\n` +
-        `Exemplos:\n` +
-        `<code>/meta 10000 impressoes</code>\n` +
-        `<code>/meta 500 seguidores</code>`
-      );
-    }
-    try {
-      const goal = JSON.parse(raw);
-      return ctx.replyWithHTML(
-        `🎯 <b>Meta atual:</b> ${goal.value.toLocaleString('pt-BR')} ${goal.type}\n` +
-        `<i>Definida em ${new Date(goal.set_at).toLocaleDateString('pt-BR')}</i>\n\n` +
-        `Para alterar: <code>/meta [valor] [tipo]</code>`
-      );
-    } catch {
-      return ctx.replyWithHTML(`⚠️ Meta com formato inválido no banco. Redefina com <code>/meta [valor] [tipo]</code>.`);
-    }
-  }
-
-  const value = parseInt(args[0], 10);
-  const type = (args[1] || '').toLowerCase();
-
-  if (isNaN(value) || value <= 0) {
-    return ctx.replyWithHTML(`❌ Valor inválido. Use um número inteiro positivo.\nExemplo: <code>/meta 10000 impressoes</code>`);
-  }
-
-  const validTypes = ['impressoes', 'seguidores'];
-  if (!validTypes.includes(type)) {
+  if (!raw) {
+    const stored = await getSetting('follower_goal');
+    const goal = stored ? parseInt(stored, 10) : 1000;
     return ctx.replyWithHTML(
-      `❌ Tipo inválido: <code>${escHtml(type)}</code>\n\n` +
-      `Tipos aceitos: <code>impressoes</code> · <code>seguidores</code>\n\n` +
-      `Exemplos:\n<code>/meta 10000 impressoes</code>\n<code>/meta 500 seguidores</code>`
+      `🎯 <b>Meta atual:</b> ${goal.toLocaleString('pt-BR')} seguidores\n\n` +
+      `Para alterar: <code>/meta [número]</code>\nExemplo: <code>/meta 5000</code>`
     );
   }
 
-  await saveSetting('metric_goal', JSON.stringify({ type, value, set_at: new Date().toISOString() }));
-  ctx.replyWithHTML(`🎯 <b>Meta salva:</b> ${value.toLocaleString('pt-BR')} ${type}\nAparece no relatório semanal de domingo.`);
+  const value = parseInt(raw, 10);
+  if (isNaN(value) || value <= 0) {
+    return ctx.replyWithHTML(`❌ Valor inválido. Use um número inteiro positivo.\nExemplo: <code>/meta 1000</code>`);
+  }
+
+  await saveSetting('follower_goal', String(value));
+  ctx.replyWithHTML(`🎯 <b>Meta salva:</b> ${value.toLocaleString('pt-BR')} seguidores\nAparece no relatório de terça e sexta.`);
 });
 
 bot.command('metricas', async (ctx) => {
@@ -405,6 +382,17 @@ bot.command('metricas', async (ctx) => {
   } catch (err) {
     await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
     ctx.replyWithHTML(`❌ <b>Erro:</b> ${escHtml(err.message)}`);
+  }
+});
+
+bot.command('relatorio', async (ctx) => {
+  const loadingMsg = await ctx.reply('📡 Coletando dados e gerando relatório...');
+  try {
+    await generateReport(bot.telegram);
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+  } catch (err) {
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    ctx.replyWithHTML(`❌ <b>Erro ao gerar relatório:</b> ${escHtml(err.message)}`);
   }
 });
 
@@ -632,7 +620,7 @@ async function handleCopilotEditReply(ctx, editedText, editState) {
     OWNER_CHAT_ID,
     pending.messageId,
     null,
-    buildSuggestionMessage(pending.tweetText, pending.tweetUrl, pending.metrics, trimmed, true, pending.trendName || null),
+    buildSuggestionMessage(pending.tweetText, pending.tweetUrl, pending.authorUsername, pending.metrics, pending.velocity ?? 0, trimmed, true),
     {
       parse_mode: 'HTML',
       disable_web_page_preview: true,

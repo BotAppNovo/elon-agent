@@ -10,12 +10,9 @@ const { formatPostPreview, postToStorableContent } = require('./utils');
 const X_USERNAME = process.env.X_USERNAME || null;
 const OWNER_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// Horários X — 5x por dia (Brasília)
+// Horários X — 2x por dia (Brasília)
 const SCHEDULE = [
   { label: '8h',  cron: '0 8  * * *' },
-  { label: '10h', cron: '0 10 * * *' },
-  { label: '13h', cron: '0 13 * * *' },
-  { label: '17h', cron: '0 17 * * *' },
   { label: '20h', cron: '0 20 * * *' },
 ];
 
@@ -26,7 +23,7 @@ const SCHEDULE = [
  * @param {Object}   telegram         - instância bot.telegram (API de baixo nível do Telegraf)
  */
 function startScheduler(sendForApproval, telegram) {
-  // X — 5 posts por dia
+  // X — 2 posts por dia
   SCHEDULE.forEach(({ label, cron: expression }) => {
     cron.schedule(
       expression,

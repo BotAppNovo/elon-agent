@@ -82,6 +82,14 @@ async function initDb() {
       expires_at TIMESTAMPTZ NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS profile_snapshots (
+      id                SERIAL PRIMARY KEY,
+      followers_count   INTEGER     NOT NULL DEFAULT 0,
+      impressions_total INTEGER     NOT NULL DEFAULT 0,
+      likes_total       INTEGER     NOT NULL DEFAULT 0,
+      coletado_em       TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   // Default: autonomous_mode off
@@ -308,6 +316,30 @@ async function getWorstPerformerPosts(limit = 3, days = 14) {
   return res.rows;
 }
 
+// ----- Profile Snapshots -----
+
+async function saveProfileSnapshot({ followers_count, impressions_total, likes_total }) {
+  await getPool().query(
+    `INSERT INTO profile_snapshots (followers_count, impressions_total, likes_total)
+     VALUES ($1, $2, $3)`,
+    [followers_count || 0, impressions_total || 0, likes_total || 0]
+  );
+}
+
+async function getLatestProfileSnapshot() {
+  const res = await getPool().query(
+    'SELECT * FROM profile_snapshots ORDER BY coletado_em DESC LIMIT 1'
+  );
+  return res.rows[0] || null;
+}
+
+async function getPreviousProfileSnapshot() {
+  const res = await getPool().query(
+    'SELECT * FROM profile_snapshots ORDER BY coletado_em DESC LIMIT 1 OFFSET 1'
+  );
+  return res.rows[0] || null;
+}
+
 // ----- Trends -----
 
 async function saveApprovedTrend(trend, angle) {
@@ -351,6 +383,9 @@ module.exports = {
   getMetricsSummary,
   getTopPerformerPosts,
   getWorstPerformerPosts,
+  saveProfileSnapshot,
+  getLatestProfileSnapshot,
+  getPreviousProfileSnapshot,
   saveApprovedTrend,
   getActiveTrends,
   clearExpiredTrends,

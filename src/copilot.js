@@ -40,9 +40,9 @@ const X_USERNAME = process.env.X_USERNAME || null;
 // ─── Cascata de thresholds ───────────────────────────────────────────────────
 
 const CASCADE_PASSES = [
-  { minLikes: 500, minVelocity: 150, label: 'Passe 1 (viral)'  },
-  { minLikes: 200, minVelocity:  60, label: 'Passe 2 (quente)' },
-  { minLikes:  80, minVelocity:  20, label: 'Passe 3 (piso)'   },
+  { minLikes: 1000, minVelocity: 300, label: 'Passe 1 (viral)'  },
+  { minLikes:  300, minVelocity:  80, label: 'Passe 2 (quente)' },
+  { minLikes:   50, minVelocity:  15, label: 'Passe 3 (piso)'   },
 ];
 
 // ─── Velocidade de engajamento (likes/hora) ───────────────────────────────────
@@ -143,8 +143,15 @@ REGRAS:
 - Zero hashtags, zero links, no máximo 1 emoji
 - NUNCA mencionar Myndit, app ou produto
 - Nunca responder SKIP — sempre gere algo
+- NUNCA começar com "Que lindo!", "Que incrível!", "Adorei", "Que demais" — soa falso
+- NUNCA usar emoji verde 💚 ou qualquer emoji de marca
+- Começar com letra minúscula quando o tom for casual — é assim que o brasileiro real escreve no X
+- O humor deve ser seco, inteligente ou autodepreciativo — nunca entusiasmado
 
-EXEMPLOS:
+TOM CERTO:
+Tweet: 'saudade' → 'o coração lembra de tudo que a cabeça tenta esquecer'
+Tweet: 'namorado perfeito' → 'namorado bom é o que lembra dos detalhes sem precisar de lembrete'
+Tweet: 'minha memória afetiva' → 'sorte sua, a minha é seletiva demais'
 Tweet: 'brasil perdeu' → 'perder dói menos que lembrar que eu apostei no brasil'
 Tweet: 'não aguento mais segunda' → 'o pior da segunda é lembrar de tudo que eu disse que ia fazer na sexta'
 Tweet: 'que calor absurdo' → 'meu cérebro derreteu junto e agora não lembro nem o que ia fazer hoje'

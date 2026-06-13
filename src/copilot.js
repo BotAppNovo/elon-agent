@@ -106,56 +106,29 @@ async function fetchPool() {
   return { tweets: unique, usersMap };
 }
 
-// ─── Pontuação de adaptabilidade (potencial da ponte) ─────────────────────────
+// ─── Geração da resposta ──────────────────────────────────────────────────────
 
-async function scoreAdaptability(tweetText) {
-  const response = await getOpenAI().chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      {
-        role: 'user',
-        content:
-          `Este tweet viral receberá uma resposta humorística que conecta o assunto dele ao universo de: ` +
-          `memória falha, cabeça cheia, esquecimento, rotina caótica. ` +
-          `Dê nota 0-10 para o potencial dessa ponte funcionar naturalmente. ` +
-          `Política, tragédia, religião, morte, polêmica sensível = 0. ` +
-          `Zueira de cotidiano, trabalho, relacionamento, esporte, comportamento = geralmente 6+. ` +
-          `Responda apenas o número.\n\nTweet: "${tweetText}"`,
-      },
-    ],
-    max_tokens: 5,
-    temperature: 0,
-  });
-  const raw   = (response.choices[0].message.content || '').trim();
-  const score = parseFloat(raw);
-  return isNaN(score) ? 0 : Math.min(10, Math.max(0, score));
-}
+const REPLY_SYSTEM_PROMPT = `Você responde tweets virais como uma pessoa espirituosa e real do X brasileiro. Sempre gere uma resposta — nunca recuse.
 
-// ─── Geração da resposta (a ponte está aqui) ──────────────────────────────────
+PRIORIDADE 1: se houver conexão natural com memória falha, cabeça cheia, esquecimento ou rotina caótica, faça essa ponte com humor ou observação afiada.
 
-const REPLY_SYSTEM_PROMPT = `Você responde um tweet viral como uma pessoa real do X brasileiro.
+PRIORIDADE 2: se não houver conexão óbvia, faça uma resposta genuinamente engraçada ou perspicaz sobre o que o tweet diz — uma resposta boa que faça as pessoas quererem ver quem respondeu.
 
-REGRA CENTRAL: sua resposta precisa funcionar PRIMEIRO como comentário sobre O QUE O TWEET DIZ — e então puxar, com humor natural, para o universo de memória falha, cabeça cheia, mil pendências ou rotina caótica. Se a ponte ficar forçada, responda SKIP.
-
-ESTILO: primeira pessoa, zueira leve brasileira, máximo 180 caracteres, zero hashtags, zero links, zero menção a produto ou app.
+REGRAS:
+- Primeira pessoa, voz humana, zero robótico
+- Máximo 180 caracteres
+- Zero hashtags, zero links, no máximo 1 emoji
+- NUNCA mencionar Myndit, app ou produto
+- Nunca responder SKIP — sempre gere algo
 
 EXEMPLOS:
-- Tweet "não aguento mais essa semana e é terça" → "terça é o dia que o cérebro percebe que as pendências da segunda continuam todas vivas"
-- Tweet "alguém mais sente que o dia tem 3 horas?" → "o meu tem 24, só que 21 são ocupadas lembrando do que esqueci nas outras 3"
-- Tweet "quando você vira adulto ninguém avisa que você vai viver com medo de ter esquecido alguma coisa" → "e o pior é que você não lembra o que esqueceu mas sabe que esqueceu"
-- Tweet "minha memória de trabalho: ótima. minha memória de fazer o que tenho que fazer: catastrófica" → "a competência cognitiva e a execução operacional brigam todo dia e quem perde é sempre a minha to-do list"
-- Tweet "como pode ser segunda de novo" → "e já com 37 pendências na cabeça que sobreviveram ao final de semana"
-- Tweet "meu cérebro no trabalho: incapaz. meu cérebro às 2h da manhã: lembrou de tudo que atrasou" → "e aí você fica acordado resolvendo mentalmente o que devia ter feito de dia"
+Tweet: 'brasil perdeu' → 'perder dói menos que lembrar que eu apostei no brasil'
+Tweet: 'não aguento mais segunda' → 'o pior da segunda é lembrar de tudo que eu disse que ia fazer na sexta'
+Tweet: 'que calor absurdo' → 'meu cérebro derreteu junto e agora não lembro nem o que ia fazer hoje'
+Tweet: 'alguém me explica adultos' → 'a gente não sabe, só fica fingindo que lembra de tudo que precisa fazer'
+Tweet: 'novo iPhone saiu' → 'vou comprar e esquecer a senha no primeiro dia como de costume'
 
-PROIBIDO:
-- Resposta genérica que serviria em qualquer tweet
-- "Que interessante", "Concordo plenamente", "Já parou para pensar"
-- Tom de marca, tom de coach, tom de consultoria
-- Reformular o que o tweet já disse
-
-Se a ponte não funcionar naturalmente: responda apenas SKIP (maiúsculas, nada mais).
-
-Retorne APENAS o texto da resposta ou SKIP, sem aspas, sem prefixo.`;
+Retorne APENAS o texto da resposta, sem aspas, sem prefixo.`;
 
 async function generateReply(tweetText) {
   const response = await getOpenAI().chat.completions.create({
@@ -164,7 +137,7 @@ async function generateReply(tweetText) {
       { role: 'system', content: REPLY_SYSTEM_PROMPT },
       {
         role: 'user',
-        content: `Tweet para responder:\n"${tweetText}"\n\nGere uma resposta de no máximo 180 caracteres ou responda SKIP.`,
+        content: `Tweet para responder:\n"${tweetText}"\n\nGere uma resposta de no máximo 180 caracteres.`,
       },
     ],
     max_tokens: 100,
@@ -325,47 +298,13 @@ async function runCopilotSearch(telegram) {
     .slice(0, 10);
   console.log(`[copilot] Top 10 por velocidade selecionados (${passUsed})`);
 
-  // 6. Pontuação de adaptabilidade
-  console.log(`[copilot] Pontuando ${top10.length} candidatos por adaptabilidade...`);
-  const scored = [];
-  for (const tweet of top10) {
-    let score = 6; // fallback otimista se IA falhar
-    try {
-      score = await scoreAdaptability(tweet.text);
-    } catch (err) {
-      console.error(`[copilot] Erro ao pontuar ${tweet.id}:`, err.message);
-    }
-    const velocity = calcVelocity(tweet);
-    const likes    = tweet.public_metrics?.like_count ?? 0;
-    console.log(`[copilot] Tweet ${tweet.id} — score: ${score} · ${likes} likes · ${velocity.toFixed(1)}/h`);
-    scored.push({ tweet, score, velocity });
-  }
-
-  // Ordenar: score×100 + velocidade (maior primeiro)
-  scored.sort((a, b) => (b.score * 100 + b.velocity) - (a.score * 100 + a.velocity));
-
-  // 7. Aprovação e geração: ≥6 sempre; 4-5 só se <5 aprovados; <4 descarta
-  let approvedCount  = 0;
+  // 6. Geração de respostas para todos os top10
   let suggestionsSent = 0;
 
-  for (const { tweet, score, velocity } of scored) {
-    if (score < 4) {
-      console.log(`[copilot] Tweet ${tweet.id} — score ${score} < 4, descartado.`);
-      continue;
-    }
-    if (score < 6 && approvedCount >= 5) {
-      console.log(`[copilot] Tweet ${tweet.id} — score ${score} (4-5) mas já ${approvedCount} aprovados, pulando.`);
-      continue;
-    }
-
+  for (const tweet of top10) {
+    const velocity = calcVelocity(tweet);
     try {
       const replyText = await generateReply(tweet.text);
-
-      if (!replyText || replyText.toUpperCase() === 'SKIP') {
-        console.log(`[copilot] Tweet ${tweet.id} — resposta SKIP, descartado.`);
-        await saveSuggestedTweet(tweet.id, 'SKIP');
-        continue;
-      }
 
       const author         = usersMap[tweet.author_id];
       const authorUsername = author?.username || 'i/web';
@@ -401,21 +340,20 @@ async function runCopilotSearch(telegram) {
         messageId:      message.message_id,
       });
 
-      approvedCount++;
       suggestionsSent++;
-      console.log(`[copilot] Sugestão enviada — tweet ${tweet.id} (score: ${score}, vel: ${velocity.toFixed(1)}/h)`);
+      console.log(`[copilot] Sugestão enviada — tweet ${tweet.id} (vel: ${velocity.toFixed(1)}/h)`);
     } catch (err) {
       console.error(`[copilot] Erro ao processar tweet ${tweet.id}:`, err.message);
     }
   }
 
   if (suggestionsSent === 0 && telegram && OWNER_CHAT_ID) {
-    const top = scored[0];
+    const best = top10[0];
     let diagMsg = `📊 ${pool.length} tweets analisados.`;
-    if (top) {
-      diagMsg += ` Melhor candidato: ${top.tweet.public_metrics?.like_count ?? 0} likes, ${top.velocity.toFixed(1)}/h.`;
+    if (best) {
+      diagMsg += ` Melhor candidato: ${best.public_metrics?.like_count ?? 0} likes, ${calcVelocity(best).toFixed(1)}/h.`;
     }
-    diagMsg += ` Nenhuma sugestão enviada (todos descartados por SKIP ou score insuficiente).`;
+    diagMsg += ` Nenhuma sugestão enviada (erro na geração).`;
     await telegram.sendMessage(OWNER_CHAT_ID, diagMsg).catch(() => {});
   }
 
